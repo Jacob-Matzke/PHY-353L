@@ -99,6 +99,13 @@ CONFIG = {
         # "Run 2": ...,
     },
 
+    # 1-sigma RELATIVE uncertainty of the V calibration factor (set by the
+    # multimeter used to fix the scope gain). Propagates as a SYSTEMATIC on DV:
+    #   sigma_cal = v_calibration_rel_err * DV
+    # Unlike the fit error it does NOT shrink with more data points -- it is the
+    # accuracy floor. e.g. 0.005 = 0.5% DMM accuracy. 0.0 disables it.
+    "v_calibration_rel_err": 0.0,
+
     # --- peak indexing ---------------------------------------------------- #
     # n assigned to each run's FIRST detected peak in the V = n*DV + V0 fit.
     # Run 1's sweep started above the first maximum, so its first detected peak
@@ -295,6 +302,25 @@ def _vlabel(factor: float) -> str:
             else "Accelerating voltage U (recorded V)")
 
 
+def _label_vlines(ax, positions: dict, fmt, line_label: str,
+                  headroom: float = 0.18) -> None:
+    """Draw labeled vertical dashed lines without colliding with the title.
+
+    Adds a headroom band at the top of the axes and places each label INSIDE
+    that band (just under the top spine) with a small white backing box.
+    `positions` maps key -> x; `fmt(key, x)` returns the label text.
+    """
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(ymin, ymax + headroom * (ymax - ymin))
+    for i, key in enumerate(sorted(positions)):
+        x = positions[key]
+        ax.axvline(x, color="0.25", ls="--", lw=1.0, alpha=0.7,
+                   label=line_label if i == 0 else None)
+        ax.text(x, 0.99, fmt(key, x), transform=ax.get_xaxis_transform(),
+                va="top", ha="center", fontsize=8, color="0.2",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="0.8", alpha=0.85))
+
+
 def plot_iv(df: pd.DataFrame, run: str, cfg: dict = CONFIG,
             tag: str = "iv", title: Optional[str] = None,
             trend: bool = True, save_path: Optional[str] = None) -> str:
@@ -393,12 +419,9 @@ def plot_overlay(results: dict, cfg: dict = CONFIG, normalize: bool = True,
         start = peak_n_start(r.run, cfg)
         for j, v in enumerate(pv):
             n_to_vs.setdefault(start + j, []).append(float(v))
-    for i, n in enumerate(sorted(n_to_vs)):
-        mv = float(np.mean(n_to_vs[n]))
-        ax.axvline(mv, color="0.25", ls="--", lw=1.0, alpha=0.7,
-                   label="mean peak V (by n)" if i == 0 else None)
-        ax.text(mv, 1.01, f"n{n}\n{mv:.2f}", va="bottom", ha="center",
-                transform=ax.get_xaxis_transform(), fontsize=8, color="0.25")
+    means = {n: float(np.mean(v)) for n, v in n_to_vs.items()}
+    _label_vlines(ax, means, fmt=lambda n, mv: f"n{n}\n{mv:.2f} V",
+                  line_label="mean peak V (by n)")
 
     ax.set_xlabel("Accelerating voltage U (V, calibrated)")
     ax.set_ylabel("Collector current I (normalized)" if normalize
@@ -459,8 +482,19 @@ def combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1) -> dict:
             "n": n, "v": pv,
         }
 
+    # calibration systematic: DV scales linearly with the gain factor, so a
+    # relative factor uncertainty maps 1:1 onto DV (common-mode, does not shrink
+    # with N). Combined with the fit (statistical) error in quadrature.
+    rel = abs(float(cfg.get("v_calibration_rel_err", 0.0)))
+    slope_cal_err = rel * slope
+    slope_total_err = float(np.hypot(slope_err, slope_cal_err))
+
     return {
-        "slope": float(slope), "slope_err": slope_err,
+        "slope": float(slope),
+        "slope_err": slope_err,               # statistical (fit) only
+        "slope_cal_err": float(slope_cal_err),  # calibration systematic
+        "slope_total_err": slope_total_err,     # stat (+) cal in quadrature
+        "rel_cal_err": rel,
         "offsets": offsets, "intercept": float(np.mean(list(offsets.values()))),
         "rms_resid": float(np.sqrt(np.mean(resid ** 2))),
         "n_all": np.concatenate([n_per_run[k][0] for k in run_names]),
@@ -484,7 +518,14 @@ def plot_combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1,
         # shared slope, this run's offset -> parallel lines
         ax.plot(nn, fit["slope"] * nn + pr["intercept"], color=color,
                 lw=1.2, alpha=0.7, zorder=3)
-    txt = (f"shared $\\Delta V$ = {fit['slope']:.3f} $\\pm$ {fit['slope_err']:.3f} V\n"
+    if fit["slope_cal_err"] > 0:
+        dv_line = (f"shared $\\Delta V$ = {fit['slope']:.3f} V\n"
+                   f"   $\\pm$ {fit['slope_err']:.3f} (stat) "
+                   f"$\\pm$ {fit['slope_cal_err']:.3f} (cal)\n"
+                   f"   = {fit['slope']:.3f} $\\pm$ {fit['slope_total_err']:.3f} V (total)")
+    else:
+        dv_line = f"shared $\\Delta V$ = {fit['slope']:.3f} $\\pm$ {fit['slope_err']:.3f} V"
+    txt = (f"{dv_line}\n"
            f"RMS resid = {fit['rms_resid']:.3f} V\n"
            f"(Hg literature: {hg_lit} V)")
     ax.text(0.03, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
@@ -529,11 +570,9 @@ def plot_contact_corrected(results: dict, cfg: dict = CONFIG, normalize: bool = 
 
     # gridlines at every peak index present across runs (Run 1 may reach higher n)
     all_n = sorted({int(v) for pr in fit["per_run"].values() for v in pr["n"]})
-    for j, n in enumerate(all_n):
-        ax.axvline(slope * n, color="0.25", ls="--", lw=1.0, alpha=0.7,
-                   label=f"n$\\cdot\\Delta V$ ({slope:.2f} V)" if j == 0 else None)
-        ax.text(slope * n, 1.01, f"{n}", va="bottom", ha="center",
-                transform=ax.get_xaxis_transform(), fontsize=8, color="0.25")
+    positions = {n: slope * n for n in all_n}
+    _label_vlines(ax, positions, fmt=lambda n, x: f"n{n}",
+                  line_label=f"n$\\cdot\\Delta V$ ({slope:.2f} V)")
 
     ax.set_xlabel("Contact-potential-corrected voltage  U - V$_0$  (V)")
     ax.set_ylabel("Collector current I (normalized)" if normalize
