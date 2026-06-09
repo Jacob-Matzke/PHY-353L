@@ -41,10 +41,10 @@ from scipy.ndimage import median_filter
 
 CONFIG = {
     # --- loading ---------------------------------------------------------- #
-    "data_root": "Mercury Data",
-    "skip_rows": 11,                 # scope CSV header rows before "Second,Value"
-    "channel_v": "SDS824X_HD_CSV_C1_1.csv",   # -> V (accelerating voltage)
-    "channel_i": "SDS824X_HD_CSV_C2_1.csv",   # -> I (collector current)
+    "data_root": "Neon Data",
+    "skip_rows": 18,                 # scope CSV header rows before "Second,Value"
+    "channel_v": "F0001CH1.csv",   # -> V (accelerating voltage)
+    "channel_i": "F0001CH2.csv",   # -> I (collector current)
 
     # --- 2. noise removal ------------------------------------------------- #
     "denoise": {
@@ -95,7 +95,6 @@ CONFIG = {
     # "default" applies to any run not listed explicitly.
     "v_calibration": {
         "default": 10.0,
-        "Run 1"  : 5.0,
         # "Run 2": ...,
     },
 
@@ -106,13 +105,18 @@ CONFIG = {
     # accuracy floor. e.g. 0.005 = 0.5% DMM accuracy. 0.0 disables it.
     "v_calibration_rel_err": 0.0,
 
+    # --- expected physics (combined-fit annotation only) ------------------ #
+    # element symbol and its literature Franck-Hertz peak spacing (V), shown as
+    # the reference line in the combined-fit plot. Hg ~ 4.9 V, Ne ~ 18.7 V.
+    "element": "Hg",
+    "literature_dv": 4.9,
+
     # --- peak indexing ---------------------------------------------------- #
     # n assigned to each run's FIRST detected peak in the V = n*DV + V0 fit.
     # Run 1's sweep started above the first maximum, so its first detected peak
     # is really the 2nd peak -> index it from n=2.
     "peak_index": {
         "default": 1,
-        "Run 1"  : 2,
     },
 
     # --- output ----------------------------------------------------------- #
@@ -168,17 +172,73 @@ class PipelineResult:
 # 1. Loading                                                                  #
 # --------------------------------------------------------------------------- #
 
-def _load_channel(path: str, skip_rows: int) -> pd.DataFrame:
-    # skip_rows metadata lines, then the next line ("Second,Value") is the header
-    return pd.read_csv(path, skiprows=skip_rows)
+def _find_header_row(path: str) -> int:
+    """Locate the data header line (the one with both 'Second' and 'Value').
+
+    Works across scope export formats (Siglent: line 12; Tektronix: line 19),
+    where metadata rows precede the real columns.
+    """
+    with open(path, "r", errors="ignore") as f:
+        for i, line in enumerate(f):
+            fields = [c.strip() for c in line.split(",")]
+            if "Second" in fields and "Value" in fields:
+                return i
+            if i > 100:
+                break
+    return 0  # fall back to top if not found
+
+
+def _load_channel(path: str, skip_rows: int = None) -> pd.DataFrame:
+    """Read one channel file -> DataFrame with numeric Second, Value columns.
+
+    Auto-detects the header row, then selects Second/Value by COLUMN POSITION
+    (read header=None). This handles both the Siglent layout (data in cols 0-1)
+    and the Tektronix layout (data in cols 3-4 with metadata interleaved and
+    trailing commas that would otherwise misalign a name-based selection).
+    """
+    hdr = _find_header_row(path)
+    with open(path, "r", errors="ignore") as f:
+        fields = None
+        for i, line in enumerate(f):
+            if i == hdr:
+                fields = [c.strip() for c in line.split(",")]
+                break
+    sec_i, val_i = fields.index("Second"), fields.index("Value")
+    raw = pd.read_csv(path, skiprows=hdr + 1, header=None, skipinitialspace=True)
+    sec = pd.to_numeric(raw.iloc[:, sec_i], errors="coerce")
+    val = pd.to_numeric(raw.iloc[:, val_i], errors="coerce")
+    return pd.DataFrame({"Second": sec, "Value": val}).dropna().reset_index(drop=True)
+
+
+def _find_channel_file(run_dir: str, configured: str, which: int) -> str:
+    """Resolve a channel file: use the configured name if present, else search
+    for a CH1/CH2 (or C1/C2) file so different scopes' naming both work."""
+    p = os.path.join(run_dir, configured)
+    if os.path.isfile(p):
+        return p
+    import glob as _glob
+    patterns = [f"*CH{which}*", f"*C{which}_*", f"*_C{which}.*", f"*CH{which}.*"]
+    for pat in patterns:
+        hits = sorted(h for h in _glob.glob(os.path.join(run_dir, pat))
+                      if h.lower().endswith(".csv"))
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(
+        f"no channel-{which} CSV found in {run_dir!r} "
+        f"(looked for {configured!r} and *CH{which}* patterns)")
 
 
 def load_run(run: str, cfg: dict = CONFIG) -> pd.DataFrame:
     """Load one run directory into a combined DataFrame with columns Second, V, I."""
     run_dir = run if os.path.isdir(run) else os.path.join(cfg["data_root"], run)
-    v = _load_channel(os.path.join(run_dir, cfg["channel_v"]), cfg["skip_rows"])
-    i = _load_channel(os.path.join(run_dir, cfg["channel_i"]), cfg["skip_rows"])
-    df = pd.DataFrame({"Second": v["Second"], "V": v["Value"], "I": i["Value"]})
+    vpath = _find_channel_file(run_dir, cfg["channel_v"], 1)
+    ipath = _find_channel_file(run_dir, cfg["channel_i"], 2)
+    v = _load_channel(vpath)
+    i = _load_channel(ipath)
+    n = min(len(v), len(i))  # guard against unequal lengths between channels
+    df = pd.DataFrame({"Second": v["Second"].to_numpy()[:n],
+                       "V": v["Value"].to_numpy()[:n],
+                       "I": i["Value"].to_numpy()[:n]})
     return df.reset_index(drop=True)
 
 
@@ -187,8 +247,10 @@ def load_run(run: str, cfg: dict = CONFIG) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 def _running_average(y: np.ndarray, window: int) -> np.ndarray:
-    if window < 2:
+    window = int(window)
+    if window < 2 or len(y) == 0:
         return y.copy()
+    window = min(window, len(y))   # clamp so it works on small (e.g. Neon) datasets
     kernel = np.ones(window) / window
     # 'same' length, edge-padded so endpoints are not pulled toward zero
     pad = window // 2
@@ -447,6 +509,13 @@ def combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1) -> dict:
     Also returns each run's independent fit for reference.
     """
     run_names = [name for name, r in results.items() if len(r.peaks_v) >= 2]
+    if not run_names:
+        counts = {name: len(r.peaks_v) for name, r in results.items()}
+        raise ValueError(
+            "combined_fit: no run has >=2 detected peaks "
+            f"(peaks per run: {counts}). The peak-finding config is likely wrong "
+            "for this dataset -- e.g. smooth_window/downsample too large for a "
+            "small (Neon) record, or prominence too high. Retune CONFIG['peaks'].")
     idx_map = {name: j for j, name in enumerate(run_names)}
     R = len(run_names)
 
@@ -504,9 +573,11 @@ def combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1) -> dict:
 
 
 def plot_combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1,
-                      hg_lit: float = 4.9, tag: str = "") -> str:
+                      hg_lit: float = None, tag: str = "") -> str:
     """Scatter peak voltage vs peak number for all runs + the pooled linear fit."""
     _ensure_dir(cfg["save_dir"])
+    element = cfg.get("element", "")
+    lit = hg_lit if hg_lit is not None else cfg.get("literature_dv", 4.9)
     fit = combined_fit(results, cfg, n_start)
     fig, ax = plt.subplots(figsize=(9, 6))
     cmap = plt.get_cmap("tab10")
@@ -525,9 +596,10 @@ def plot_combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1,
                    f"   = {fit['slope']:.3f} $\\pm$ {fit['slope_total_err']:.3f} V (total)")
     else:
         dv_line = f"shared $\\Delta V$ = {fit['slope']:.3f} $\\pm$ {fit['slope_err']:.3f} V"
+    lit_label = f"{element} literature".strip() or "literature"
     txt = (f"{dv_line}\n"
            f"RMS resid = {fit['rms_resid']:.3f} V\n"
-           f"(Hg literature: {hg_lit} V)")
+           f"({lit_label}: {lit} V)")
     ax.text(0.03, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
     ax.set_xlabel("Peak number n")
