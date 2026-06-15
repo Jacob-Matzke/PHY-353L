@@ -65,6 +65,29 @@ CONFIG = {
         "enabled": False,
         "offset": 0.0,     # nm
         "scale": 1.0,      # dimensionless
+        # OceanView pixel -> wavelength calibration of the HR4000 (used for the
+        # wavelength-calibration UNCERTAINTY, not to recompute the axis -- the
+        # files already store wavelength = poly(pixel) to within the readout):
+        #     lambda(p) = c0 + c1*p + c2*p^2 + c3*p^3 ,  p = pixel index (0..N-1)
+        "poly": {
+            "c0": 629.6664627,      # intercept (nm)
+            "c1": 0.018337985,      # nm / pixel
+            "c2": -1.22763e-06,     # nm / pixel^2
+            "c3": 0.0,              # nm / pixel^3
+            "r_squared": 0.99999993,
+            "n_pixels": 3648,       # Toshiba TCD1304 linear CCD (HR4000)
+        },
+    },
+
+    # --- readout / quantization uncertainty ------------------------------- #
+    # 1-sigma taken as +/- 1/2 of the last recorded decimal place:
+    #   wavelengths printed to 1e-5 nm  -> 0.5e-5 = 5e-6 nm
+    #   intensities printed to 1e-2 cts -> 0.5e-2 = 5e-3 counts
+    # The wavelength readout is the SAME pixel grid every trial (common-mode);
+    # the intensity readout is independent per sample and enters the fit.
+    "readout": {
+        "wavelength_nm": 5e-6,
+        "intensity": 5e-3,
     },
 
     # --- 3. crop ---------------------------------------------------------- #
@@ -116,10 +139,21 @@ class FitResult:
     lambda_H: float
     lambda_D: float
     dlambda: float                    # lambda_H - lambda_D
+    # reported 1-sigma = quadrature of the fit, calibration and readout terms
     lambda_H_err: float
     lambda_D_err: float
     dlambda_err: float
     chi2_dof: float
+    # --- uncertainty breakdown (so the budget is transparent) ------------- #
+    # statistical, from the weighted fit covariance (independent per trial):
+    lambda_H_err_fit: float = float("nan")
+    lambda_D_err_fit: float = float("nan")
+    dlambda_err_fit: float = float("nan")
+    # wavelength-calibration systematic (common-mode across trials):
+    lambda_H_err_cal: float = float("nan")
+    lambda_D_err_cal: float = float("nan")
+    dlambda_err_cal: float = float("nan")
+    rel_cal: float = 0.0              # fractional calibration uncertainty
     success: bool = True
     config: dict = field(default_factory=dict)
 
@@ -137,9 +171,12 @@ class FitResult:
             f"  fit window       : {self.fit_wl.min():.3f} - {self.fit_wl.max():.3f} nm "
             f"({len(self.fit_wl)} pts)",
             f"  converged        : {self.success}   chi2/dof = {self.chi2_dof:.2f}",
-            f"  lambda_H (H-alpha): {self.lambda_H:.4f} +/- {self.lambda_H_err:.4f} nm",
-            f"  lambda_D (D-alpha): {self.lambda_D:.4f} +/- {self.lambda_D_err:.4f} nm",
-            f"  Delta lambda      : {self.dlambda:.4f} +/- {self.dlambda_err:.4f} nm",
+            f"  lambda_H (H-alpha): {self.lambda_H:.4f} +/- {self.lambda_H_err:.4f} nm "
+            f"(fit {self.lambda_H_err_fit:.4f}, cal {self.lambda_H_err_cal:.4f})",
+            f"  lambda_D (D-alpha): {self.lambda_D:.4f} +/- {self.lambda_D_err:.4f} nm "
+            f"(fit {self.lambda_D_err_fit:.4f}, cal {self.lambda_D_err_cal:.4f})",
+            f"  Delta lambda      : {self.dlambda:.4f} +/- {self.dlambda_err:.4f} nm "
+            f"(fit {self.dlambda_err_fit:.4f}, cal {self.dlambda_err_cal:.1e})",
             f"  peak widths sigma : H {p['sigma_H']:.4f} nm,  D {p['sigma_D']:.4f} nm",
         ]
         return "\n".join(lines)
@@ -211,6 +248,31 @@ def apply_calibration(df: pd.DataFrame, cfg: dict = CONFIG) -> pd.DataFrame:
     return out
 
 
+def calibration_rel_error(wl_full: np.ndarray, cfg: dict = CONFIG) -> float:
+    """Fractional 1-sigma of the wavelength calibration, from the OceanView fit.
+
+    The pixel->wavelength polynomial was fit to reference lines with goodness
+    R^2 (CONFIG["calibration"]["poly"]["r_squared"]). The unexplained fraction
+    (1 - R^2) of the wavelength variance is the calibration's residual scatter,
+    so the absolute 1-sigma accuracy of any wavelength is
+        s_cal = sqrt(1 - R^2) * std(lambda)
+    and the FRACTIONAL accuracy is rel = s_cal / mean(lambda). Treating the
+    calibration error as a multiplicative scale (the standard model) means:
+        * an absolute line center carries  sigma = rel * lambda  (~few mAA), and
+        * the SEPARATION carries  sigma = rel * Delta_lambda,
+    because a common additive offset cancels in lambda_H - lambda_D and only the
+    scale survives -- which is why Delta lambda is essentially calibration-free.
+    Returns 0.0 if R^2 is missing or >= 1.
+    """
+    poly = cfg.get("calibration", {}).get("poly", {})
+    r2 = poly.get("r_squared")
+    if r2 is None or r2 >= 1.0:
+        return 0.0
+    wl = np.asarray(wl_full, dtype=float)
+    mean = float(np.mean(wl)) or 1.0
+    return float(np.sqrt(max(0.0, 1.0 - r2)) * np.std(wl) / mean)
+
+
 # --------------------------------------------------------------------------- #
 # 3. Crop                                                                      #
 # --------------------------------------------------------------------------- #
@@ -270,8 +332,48 @@ def initial_guess(wl: np.ndarray, it: np.ndarray, cfg: dict = CONFIG):
     return p0, (lower, upper)
 
 
+def readout_center_floor(wl: np.ndarray, it: np.ndarray, cfg: dict) -> float:
+    """The +/- 1/2-last-decimal INTENSITY readout's direct contribution to a
+    fitted line center, by linear error propagation.
+
+    If the intensity quantization were the ONLY noise, a Gaussian peak of
+    amplitude A and width sigma sampled at spacing d would locate its center to
+    roughly  sigma_I * sqrt(d / (sqrt(pi) * sigma)) / A  (the Cramer-Rao-style
+    floor). This is reported so the readout term is explicit; it is utterly
+    dominated by the real scatter (captured in the fit error), as the budget
+    shows. Returned per center (nm).
+    """
+    r = cfg.get("readout", {})
+    sig_I = float(r.get("intensity", 0.0))
+    if sig_I <= 0 or len(wl) < 2:
+        return 0.0
+    d = float(np.median(np.diff(np.sort(wl))))
+    rng = float(it.max() - it.min()) or 1.0
+    sig = float(cfg["fit"].get("sigma_guess", 0.07))
+    A = 0.5 * rng                                    # rough per-peak amplitude
+    return sig_I * np.sqrt(d / (np.sqrt(np.pi) * sig)) / max(A, 1.0)
+
+
 def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
-    """Crop to the doublet window and fit the two-Gaussian model."""
+    """Crop to the doublet window and fit the two-Gaussian model.
+
+    Uncertainty propagation (each term reported separately, summed in quadrature):
+      - FIT (statistical): the model is fit with UNIFORM weighting -- correct
+        here because the per-point noise is ~homoscedastic, so this is the
+        unbiased (max-likelihood) estimator; weighting by the tiny readout floor
+        instead would pathologically up-weight the flat baseline and bias the
+        centers. The center covariance is read off pcov with absolute_sigma=False,
+        so the error SCALE is set by the actual residuals (real shot noise + the
+        slight non-Gaussian line wings), which is the honest statistical error.
+        Delta lambda uses the full covariance var(lamH)+var(lamD)-2cov(lamH,lamD).
+      - READOUT: +/- 1/2 last decimal. The wavelength readout is a per-center
+        floor (sigma_wl); the intensity readout's center contribution
+        (readout_center_floor) is tracked but dominated -- both fold into the
+        total in quadrature.
+      - CALIBRATION (systematic): the OceanView pixel->wavelength fit accuracy
+        as a fractional (scale) error rel_cal; common-mode across trials, and it
+        nearly cancels in Delta lambda (offset cancels, only the scale remains).
+    """
     win = crop(df, cfg)
     wl = win["wavelength"].to_numpy(dtype=float)
     it = win["intensity"].to_numpy(dtype=float)
@@ -283,7 +385,7 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     success = True
     try:
         popt, pcov = curve_fit(two_gaussian, wl, it, p0=p0, bounds=bounds,
-                               maxfev=cfg["fit"]["maxfev"])
+                               absolute_sigma=False, maxfev=cfg["fit"]["maxfev"])
     except Exception as exc:  # keep the run; flag it as not converged
         print(f"  [warn] fit failed for {run!r}: {exc}")
         popt = np.array(p0, dtype=float)
@@ -296,18 +398,37 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     lam1, lam2 = popt[3], popt[6]
     i_hi, i_lo = (3, 6) if lam1 >= lam2 else (6, 3)
     lambda_H, lambda_D = popt[i_hi], popt[i_lo]
-    lambda_H_err, lambda_D_err = perr[i_hi], perr[i_lo]
+    lamH_fit, lamD_fit = perr[i_hi], perr[i_lo]
     dlambda = lambda_H - lambda_D
-    # Delta lambda uncertainty from the covariance of the two centers:
+    # Delta lambda statistical error from the covariance of the two centers:
     #   var(lamH - lamD) = var(lamH) + var(lamD) - 2 cov(lamH, lamD)
     var = pcov[i_hi, i_hi] + pcov[i_lo, i_lo] - 2.0 * pcov[i_hi, i_lo]
-    dlambda_err = float(np.sqrt(var)) if np.isfinite(var) and var > 0 else float("nan")
+    dl_fit = float(np.sqrt(var)) if np.isfinite(var) and var > 0 else float("nan")
 
     # reorder popt so params property always reports H then D consistently
     B, m = popt[0], popt[1]
     A_H, sig_H = popt[i_hi - 1], popt[i_hi + 1]
     A_D, sig_D = popt[i_lo - 1], popt[i_lo + 1]
     popt_ordered = np.array([B, m, A_H, lambda_H, sig_H, A_D, lambda_D, sig_D])
+
+    # calibration systematic (fractional scale error, common across trials)
+    rel_cal = calibration_rel_error(df["wavelength"].to_numpy(dtype=float), cfg)
+    lamH_cal = rel_cal * lambda_H
+    lamD_cal = rel_cal * lambda_D
+    dl_cal = rel_cal * abs(dlambda)        # offset cancels; only the scale survives
+
+    # readout floors on a center: wavelength quantization (sigma_wl) and the
+    # intensity quantization propagated to the center, in quadrature.
+    sig_wl = float(cfg.get("readout", {}).get("wavelength_nm", 0.0))
+    sig_read_I = readout_center_floor(wl, it, cfg)
+    read_center = float(np.hypot(sig_wl, sig_read_I))
+
+    def _tot(fit, cal, n_read):
+        return float(np.sqrt(np.nansum([fit ** 2, cal ** 2, (n_read * read_center) ** 2])))
+
+    lambda_H_err = _tot(lamH_fit, lamH_cal, 1.0)
+    lambda_D_err = _tot(lamD_fit, lamD_cal, 1.0)
+    dlambda_err = _tot(dl_fit, dl_cal, np.sqrt(2.0))
 
     resid = it - two_gaussian(wl, *popt)
     dof = max(1, len(wl) - len(popt))
@@ -323,8 +444,11 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         fit_wl=wl, fit_i=it,
         popt=popt_ordered, pcov=pcov,
         lambda_H=float(lambda_H), lambda_D=float(lambda_D), dlambda=float(dlambda),
-        lambda_H_err=float(lambda_H_err), lambda_D_err=float(lambda_D_err),
-        dlambda_err=dlambda_err,
+        lambda_H_err=lambda_H_err, lambda_D_err=lambda_D_err, dlambda_err=dlambda_err,
+        lambda_H_err_fit=float(lamH_fit), lambda_D_err_fit=float(lamD_fit),
+        dlambda_err_fit=dl_fit,
+        lambda_H_err_cal=float(lamH_cal), lambda_D_err_cal=float(lamD_cal),
+        dlambda_err_cal=float(dl_cal), rel_cal=float(rel_cal),
         chi2_dof=chi2_dof, success=success, config=dict(cfg),
     )
 
@@ -400,6 +524,7 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
     txt = (f"$\\lambda_H$ = {result.lambda_H:.4f} $\\pm$ {result.lambda_H_err:.4f} nm\n"
            f"$\\lambda_D$ = {result.lambda_D:.4f} $\\pm$ {result.lambda_D_err:.4f} nm\n"
            f"$\\Delta\\lambda$ = {result.dlambda:.4f} $\\pm$ {result.dlambda_err:.4f} nm\n"
+           f"   (fit {result.dlambda_err_fit:.4f}, cal {result.dlambda_err_cal:.0e})\n"
            f"(lit. {cfg.get('dlambda_lit', float('nan')):.3f} nm)\n"
            f"$\\chi^2$/dof = {result.chi2_dof:.2f}")
     ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
@@ -463,27 +588,45 @@ def plot_combined(results: dict, cfg: dict = CONFIG, tag: str = "combined") -> s
 # --------------------------------------------------------------------------- #
 
 def combine_runs(results: dict, cfg: dict = CONFIG) -> dict:
-    """Pool per-run fits into one reported value for each quantity.
+    """Pool per-trial fits into one reported value + uncertainty per quantity.
 
-    Each quantity (lambda_H, lambda_D, Delta lambda) is combined two ways:
-      - weighted mean using the per-fit 1-sigma (inverse-variance), with the
-        Birge ratio applied when the runs scatter more than their fit errors
-        predict (so the reported error reflects real run-to-run spread); and
-      - the plain mean / standard error, reported for comparison.
+    The error sources are combined in the physically correct order:
+      - STATISTICAL (the per-trial fit error) is INDEPENDENT between trials, so
+        it is pooled by inverse-variance weighting, with the Birge ratio applied
+        when the trials scatter more than their fit errors predict. This term
+        shrinks ~1/sqrt(N) with more trials.
+      - CALIBRATION is COMMON-MODE (same spectrometer / OceanView fit every
+        trial), so it does NOT average down -- it is added ONCE, in quadrature,
+        evaluated at the pooled value (rel_cal * value).
+      - WAVELENGTH READOUT is the same pixel grid every trial (common-mode) and
+        is likewise added once.
+    The reported `_err` is the quadrature total; `_stat`, `_cal`, `_read` expose
+    the breakdown, and the plain mean / SEM / scatter are kept for reference.
     """
     good = {k: r for k, r in results.items() if r.success}
     if not good:
         raise ValueError("combine_runs: no converged fits to combine.")
 
-    out = {"n_runs": len(good)}
-    for key, errkey in (("lambda_H", "lambda_H_err"),
-                        ("lambda_D", "lambda_D_err"),
-                        ("dlambda", "dlambda_err")):
+    rel_cal = float(np.mean([r.rel_cal for r in good.values()]))
+    sig_wl = float(cfg.get("readout", {}).get("wavelength_nm", 0.0))
+
+    out = {"n_runs": len(good), "rel_cal": rel_cal}
+    for key, fitkey, n_read in (("lambda_H", "lambda_H_err_fit", 1.0),
+                                ("lambda_D", "lambda_D_err_fit", 1.0),
+                                ("dlambda", "dlambda_err_fit", np.sqrt(2.0))):
         vals = np.array([getattr(r, key) for r in good.values()], dtype=float)
-        errs = np.array([getattr(r, errkey) for r in good.values()], dtype=float)
-        c = _weighted_combine(vals, errs)
-        out[key] = c["value"]            # reported (weighted-mean) value
-        out[key + "_err"] = c["error"]   # reported 1-sigma (Birge-inflated)
+        errs = np.array([getattr(r, fitkey) for r in good.values()], dtype=float)
+        c = _weighted_combine(vals, errs)             # pools the statistical term
+        value = c["value"]
+        stat = c["error"]
+        cal = rel_cal * abs(value)                    # common-mode, added once
+        read = n_read * sig_wl                        # common-mode, added once
+        total = float(np.sqrt(stat ** 2 + cal ** 2 + read ** 2))
+        out[key] = value
+        out[key + "_err"] = total        # reported 1-sigma (stat (+) cal (+) read)
+        out[key + "_stat"] = stat        # pooled statistical (Birge-inflated)
+        out[key + "_cal"] = cal          # calibration systematic (common-mode)
+        out[key + "_read"] = read        # wavelength readout floor
         out[key + "_mean"] = c["mean"]   # plain mean, for reference
         out[key + "_sem"] = c["sem"]     # standard error of the plain mean
         out[key + "_std"] = c["std"]     # run-to-run scatter
@@ -541,10 +684,13 @@ if __name__ == "__main__":
         comb = combine_runs(results)
         plot_combined(results)
         print("=" * 60)
-        print(f"Combined over {comb['n_runs']} runs:")
-        print(f"  lambda_H     = {comb['lambda_H']:.4f} +/- {comb['lambda_H_err']:.4f} nm")
-        print(f"  lambda_D     = {comb['lambda_D']:.4f} +/- {comb['lambda_D_err']:.4f} nm")
-        print(f"  Delta lambda = {comb['dlambda']:.4f} +/- {comb['dlambda_err']:.4f} nm")
+        print(f"Combined over {comb['n_runs']} runs "
+              f"(rel. calibration error {comb['rel_cal']:.2e}):")
+        for k, lab in (("lambda_H", "lambda_H    "), ("lambda_D", "lambda_D    "),
+                       ("dlambda", "Delta lambda")):
+            print(f"  {lab} = {comb[k]:.4f} +/- {comb[k+'_err']:.4f} nm "
+                  f"(stat {comb[k+'_stat']:.4f}, cal {comb[k+'_cal']:.1e}, "
+                  f"read {comb[k+'_read']:.1e})")
         print(f"  (plain mean Delta lambda = {comb['dlambda_mean']:.4f} "
-              f"+/- {comb['dlambda_sem']:.4f} nm SEM)")
+              f"+/- {comb['dlambda_sem']:.4f} nm SEM; scatter {comb['dlambda_std']:.4f})")
     print(f"\nPlots written to: {CONFIG['save_dir']}/")
