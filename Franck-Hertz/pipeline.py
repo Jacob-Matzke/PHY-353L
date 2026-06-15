@@ -111,6 +111,18 @@ CONFIG = {
     "element": "Hg",
     "literature_dv": 4.9,
 
+    # --- uncertainty propagation ------------------------------------------ #
+    # Per-peak position uncertainty is estimated by BOOTSTRAP: the denoise +
+    # random-sampling stage is repeated n_bootstrap times (resampling the cleaned
+    # points with replacement), and the spread of each peak's position is its
+    # 1-sigma. That sigma is then carried into the shared-slope fit via WEIGHTED
+    # least squares, so the cleaning + sampling uncertainty propagates into DV.
+    # 0 disables (fit falls back to unweighted residual-based errors).
+    "uncertainty": {
+        "n_bootstrap": 200,
+        "seed": 12345,
+    },
+
     # --- peak indexing ---------------------------------------------------- #
     # n assigned to each run's FIRST detected peak in the V = n*DV + V0 fit.
     # Run 1's sweep started above the first maximum, so its first detected peak
@@ -140,6 +152,8 @@ class PipelineResult:
     spacings_recorded: np.ndarray
     spacings_calibrated: np.ndarray
     v_factor: float = 1.0
+    peaks_v_err: np.ndarray = None        # per-peak 1-sigma (recorded V), bootstrap
+    spacings_err: np.ndarray = None       # per-spacing 1-sigma (recorded V), bootstrap
     config: dict = field(default_factory=dict)
 
     def summary(self) -> str:
@@ -151,19 +165,36 @@ class PipelineResult:
             f"  peaks found      : {len(self.peaks_v)}",
         ]
         if len(self.peaks_v):
-            vs = ", ".join(f"{v:.3f}" for v in self.peaks_v)
+            if self.peaks_v_err is not None and len(self.peaks_v_err):
+                vs = ", ".join(f"{v:.3f}+/-{e:.3f}"
+                               for v, e in zip(self.peaks_v, self.peaks_v_err))
+            else:
+                vs = ", ".join(f"{v:.3f}" for v in self.peaks_v)
             lines.append(f"  peak V (recorded): {vs}")
         if len(self.spacings_recorded):
-            sp = ", ".join(f"{s:.3f}" for s in self.spacings_recorded)
+            if self.spacings_err is not None and len(self.spacings_err):
+                sp = ", ".join(f"{s:.3f}+/-{e:.3f}"
+                               for s, e in zip(self.spacings_recorded, self.spacings_err))
+            else:
+                sp = ", ".join(f"{s:.3f}" for s in self.spacings_recorded)
             lines.append(f"  spacings (rec. V): {sp}")
+            # mean spacing uncertainty: bootstrap (per-spacing) if available, else
+            # the run-to-run scatter of the spacings
+            if self.spacings_err is not None and len(self.spacings_err):
+                mean_err = float(np.sqrt(np.sum(self.spacings_err ** 2)) / len(self.spacings_err))
+                src = "bootstrap"
+            else:
+                mean_err = (self.spacings_recorded.std(ddof=1)
+                            if len(self.spacings_recorded) > 1 else 0.0)
+                src = "scatter"
             lines.append(
                 f"  mean spacing     : {self.spacings_recorded.mean():.3f} "
-                f"+/- {self.spacings_recorded.std(ddof=1) if len(self.spacings_recorded)>1 else 0:.3f} V (recorded)"
+                f"+/- {mean_err:.3f} V (recorded, {src})"
             )
             if self.v_factor != 1.0:
                 lines.append(
-                    f"  mean spacing     : {self.spacings_calibrated.mean():.3f} V "
-                    f"(calibrated, x{self.v_factor})"
+                    f"  mean spacing     : {self.spacings_calibrated.mean():.3f} "
+                    f"+/- {mean_err*self.v_factor:.3f} V (calibrated, x{self.v_factor})"
                 )
         return "\n".join(lines)
 
@@ -427,7 +458,7 @@ def plot_peaks(df: pd.DataFrame, result: "PipelineResult", cfg: dict = CONFIG,
     ax.scatter(mx, my, color="red", zorder=5, s=50, marker="x",
                label=f"maxima (n={len(result.peaks_v)})")
     for v, x, y in zip(result.peaks_v * factor, mx, my):
-        ax.annotate(f"{v:.2f}", (x, y), textcoords="offset points",
+        ax.annotate(f"{v:.3f}", (x, y), textcoords="offset points",
                     xytext=(0, 9), ha="center", fontsize=8, color="red")
 
     ax.set_xlabel(_vlabel(factor))
@@ -519,36 +550,64 @@ def combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1) -> dict:
     idx_map = {name: j for j, name in enumerate(run_names)}
     R = len(run_names)
 
-    rows, V, n_per_run = [], [], {}
+    rows, V, sig, n_per_run, sig_per_run = [], [], [], {}, {}
+    have_sigma = True
     for name in run_names:
-        pv = np.sort(results[name].peaks_v * results[name].v_factor)
-        n = np.arange(len(pv)) + peak_n_start(results[name].run, cfg, n_start)
-        n_per_run[name] = (n, pv)
-        for ni, vi in zip(n, pv):
+        r = results[name]
+        order = np.argsort(r.peaks_v)
+        pv = (r.peaks_v * r.v_factor)[order]
+        # per-peak 1-sigma (calibrated); fall back if bootstrap unavailable
+        if r.peaks_v_err is not None and len(r.peaks_v_err) == len(pv):
+            sv = (np.asarray(r.peaks_v_err) * r.v_factor)[order]
+        else:
+            sv = np.full(len(pv), np.nan); have_sigma = False
+        n = np.arange(len(pv)) + peak_n_start(r.run, cfg, n_start)
+        n_per_run[name] = (n, pv); sig_per_run[name] = sv
+        for ni, vi, si in zip(n, pv, sv):
             row = [float(ni)] + [0.0] * R   # [shared slope | per-run intercepts]
             row[1 + idx_map[name]] = 1.0
-            rows.append(row); V.append(vi)
-    A = np.array(rows); V = np.array(V)
+            rows.append(row); V.append(vi); sig.append(si)
+    A = np.array(rows); V = np.array(V); sig = np.array(sig)
 
-    coef, *_ = np.linalg.lstsq(A, V, rcond=None)
+    # guard against zero/NaN sigma -> use weighting only if all are finite & >0
+    weighted = have_sigma and np.all(np.isfinite(sig)) and np.all(sig > 0)
+    dof = max(1, len(V) - A.shape[1])
+    if weighted:
+        W = 1.0 / sig ** 2
+        AtWA = A.T @ (A * W[:, None])
+        coef = np.linalg.solve(AtWA, A.T @ (W * V))
+        cov = np.linalg.inv(AtWA)                      # measurement-error propagated
+        resid = V - A @ coef
+        chi2 = float(np.sum((resid / sig) ** 2))
+        chi2_dof = chi2 / dof
+        slope_err_meas = float(np.sqrt(cov[0, 0]))     # if bootstrap sigmas are the whole story
+        # Birge-ratio inflation: when chi2/dof > 1 the runs scatter more than the
+        # bootstrap sigmas predict (run-to-run systematics), so scale up the error
+        # so it reflects the ACTUAL spread, not just the sampling noise.
+        birge = float(np.sqrt(max(1.0, chi2_dof)))
+        slope_err = slope_err_meas * birge
+        fit_mode = "weighted"
+    else:
+        coef, *_ = np.linalg.lstsq(A, V, rcond=None)
+        resid = V - A @ coef
+        cov = (float(resid @ resid) / dof) * np.linalg.inv(A.T @ A)
+        slope_err = float(np.sqrt(cov[0, 0]))
+        slope_err_meas = slope_err
+        chi2_dof = float("nan"); birge = float("nan")
+        fit_mode = "unweighted"
     slope = coef[0]
     offsets = {name: float(coef[1 + idx_map[name]]) for name in run_names}
 
-    resid = V - A @ coef
-    dof = max(1, len(V) - A.shape[1])
-    sigma2 = float(resid @ resid) / dof
-    cov = sigma2 * np.linalg.inv(A.T @ A)
-    slope_err = float(np.sqrt(cov[0, 0]))
-
     per_run = {}
     for name in run_names:
-        n, pv = n_per_run[name]
-        (s_i, b_i), cov_i = np.polyfit(n, pv, 1, cov=True)
+        n, pv = n_per_run[name]; sv = sig_per_run[name]
+        w = 1.0 / sv if (weighted and np.all(np.isfinite(sv)) and np.all(sv > 0)) else None
+        (s_i, b_i), cov_i = np.polyfit(n, pv, 1, w=w, cov=True)
         per_run[name] = {
             "slope": float(s_i), "slope_err": float(np.sqrt(cov_i[0, 0])),
             "intercept": offsets[name],                # shared-slope offset (for correction)
             "indep_intercept": float(b_i),
-            "n": n, "v": pv,
+            "n": n, "v": pv, "v_err": sv,
         }
 
     # calibration systematic: DV scales linearly with the gain factor, so a
@@ -560,10 +619,12 @@ def combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1) -> dict:
 
     return {
         "slope": float(slope),
-        "slope_err": slope_err,               # statistical (fit) only
+        "slope_err": slope_err,                 # statistical, scatter-inflated (reported)
+        "slope_err_meas": float(slope_err_meas),  # pure bootstrap propagation (no inflation)
         "slope_cal_err": float(slope_cal_err),  # calibration systematic
         "slope_total_err": slope_total_err,     # stat (+) cal in quadrature
         "rel_cal_err": rel,
+        "fit_mode": fit_mode, "chi2_dof": chi2_dof, "birge": birge,
         "offsets": offsets, "intercept": float(np.mean(list(offsets.values()))),
         "rms_resid": float(np.sqrt(np.mean(resid ** 2))),
         "n_all": np.concatenate([n_per_run[k][0] for k in run_names]),
@@ -584,8 +645,10 @@ def plot_combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1,
     nn = np.array([fit["n_all"].min() - 0.3, fit["n_all"].max() + 0.3])
     for k, (name, pr) in enumerate(fit["per_run"].items()):
         color = cmap(k % 10)
-        ax.scatter(pr["n"], pr["v"], color=color, s=40, zorder=4,
-                   label=f"{name} (V$_0$={pr['intercept']:.2f})")
+        yerr = pr.get("v_err")
+        yerr = yerr if (yerr is not None and np.all(np.isfinite(yerr))) else None
+        ax.errorbar(pr["n"], pr["v"], yerr=yerr, fmt="o", color=color, ms=6,
+                    capsize=3, zorder=4, label=f"{name} (V$_0$={pr['intercept']:.3f})")
         # shared slope, this run's offset -> parallel lines
         ax.plot(nn, fit["slope"] * nn + pr["intercept"], color=color,
                 lw=1.2, alpha=0.7, zorder=3)
@@ -597,8 +660,10 @@ def plot_combined_fit(results: dict, cfg: dict = CONFIG, n_start: int = 1,
     else:
         dv_line = f"shared $\\Delta V$ = {fit['slope']:.3f} $\\pm$ {fit['slope_err']:.3f} V"
     lit_label = f"{element} literature".strip() or "literature"
+    chi = (f"  ({fit['fit_mode']}, $\\chi^2$/dof={fit['chi2_dof']:.2f})"
+           if fit.get("fit_mode") == "weighted" else f"  ({fit.get('fit_mode','')})")
     txt = (f"{dv_line}\n"
-           f"RMS resid = {fit['rms_resid']:.3f} V\n"
+           f"RMS resid = {fit['rms_resid']:.3f} V{chi}\n"
            f"({lit_label}: {lit} V)")
     ax.text(0.03, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
@@ -673,13 +738,31 @@ def _slug(run: str) -> str:
 # 5 & 7. Peak finding and spacing                                             #
 # --------------------------------------------------------------------------- #
 
+def _parabolic_vertex(y: np.ndarray, i: int) -> float:
+    """Sub-sample peak location via a 3-point parabola around index i."""
+    if 0 < i < len(y) - 1:
+        a, b, c = y[i - 1], y[i], y[i + 1]
+        denom = a - 2.0 * b + c
+        if denom != 0:
+            return i + 0.5 * (a - c) / denom
+    return float(i)
+
+
 def find_fh_peaks(df: pd.DataFrame, cfg: dict = CONFIG):
-    """Find Franck-Hertz maxima in I (time/sample order). Returns (idx, V, I)."""
+    """Find Franck-Hertz maxima in I (time/sample order). Returns (idx, V, I).
+
+    Peak VOLTAGES are read off the SMOOTHED V curve at the sub-sample (parabolic)
+    peak location, NOT the raw V sample. The raw V is quantized by the scope
+    (e.g. 0.2 V on the Neon scope), which would snap every peak onto that grid and
+    make spacings artificially round; smoothing+interpolation removes that.
+    """
     c = cfg["peaks"]
     y = df["I"].to_numpy(dtype=float)
+    v = df["V"].to_numpy(dtype=float)
     mw = c.get("median_window", 0)
     yclean = median_filter(y, size=mw) if mw and mw > 1 else y
     ysm = _running_average(yclean, c["smooth_window"])
+    vsm = _running_average(v, c["smooth_window"])   # de-quantised voltage axis
 
     prominence = c["prominence"]
     if prominence is None:
@@ -687,7 +770,9 @@ def find_fh_peaks(df: pd.DataFrame, cfg: dict = CONFIG):
 
     idx, _ = find_peaks(ysm, distance=max(1, c["min_distance"]),
                         prominence=prominence)
-    peaks_v = df["V"].to_numpy()[idx]
+    grid = np.arange(len(vsm))
+    sub = np.array([_parabolic_vertex(ysm, i) for i in idx]) if len(idx) else np.array([])
+    peaks_v = np.interp(sub, grid, vsm) if len(sub) else np.array([])
     peaks_i = y[idx]
     return idx, peaks_v, peaks_i
 
@@ -696,6 +781,46 @@ def peak_spacings(peaks_v: np.ndarray) -> np.ndarray:
     if len(peaks_v) < 2:
         return np.array([])
     return np.diff(np.sort(peaks_v))
+
+
+def bootstrap_peak_uncertainty(den: pd.DataFrame, cfg: dict, n_nominal: int):
+    """Bootstrap the sampling stage to get per-peak and per-spacing 1-sigma.
+
+    Resamples the denoised points WITH REPLACEMENT (size = the downsample target,
+    mimicking the random-sampling step), re-finds the peaks, and takes the spread
+    across replicates. Captures the uncertainty injected by cleaning + sampling +
+    peak localisation. Returns (peaks_err, spacings_err) in RECORDED volts, or
+    (None, None) if disabled / too few valid replicates.
+    """
+    u = cfg.get("uncertainty", {})
+    n_boot = int(u.get("n_bootstrap", 0))
+    if n_boot <= 0 or n_nominal < 1 or len(den) < 3:
+        return None, None
+
+    ds = cfg["downsample"]
+    size = (max(1, int(round(len(den) * ds["fraction"])))
+            if ds.get("enabled", True) else len(den))
+    base = int(u.get("seed", 12345))
+    cols = den[["Second", "V", "I"]].to_numpy(dtype=float)
+
+    peak_sets, spac_sets = [], []
+    for b in range(n_boot):
+        rng = np.random.default_rng(base + b)
+        sel = rng.integers(0, len(cols), size=size)
+        sub = cols[sel]
+        sub = sub[np.argsort(sub[:, 0])]                 # keep time order
+        d2 = pd.DataFrame({"Second": sub[:, 0], "V": sub[:, 1], "I": sub[:, 2]})
+        _, pv, _ = find_fh_peaks(d2, cfg)
+        if len(pv) == n_nominal:
+            pv = np.sort(pv)
+            peak_sets.append(pv)
+            spac_sets.append(np.diff(pv))
+    if len(peak_sets) < max(5, n_boot // 10):
+        return None, None
+    peaks_err = np.std(np.array(peak_sets), axis=0, ddof=1)
+    spac_err = (np.std(np.array(spac_sets), axis=0, ddof=1)
+                if n_nominal >= 2 else np.array([]))
+    return peaks_err, spac_err
 
 
 def calibration_factor(run: str, cfg: dict = CONFIG) -> float:
@@ -730,11 +855,15 @@ def run_pipeline(run: str, cfg: dict = CONFIG, plots: bool = True) -> PipelineRe
     sp = peak_spacings(pv)
     cal = calibration_factor(run, cfg)
 
+    # bootstrap the cleaning+sampling to get per-peak / per-spacing 1-sigma
+    peaks_err, spac_err = bootstrap_peak_uncertainty(den, cfg, len(pv))
+
     result = PipelineResult(
         run=run, raw=raw, processed=proc,
         peak_idx=idx, peaks_v=pv, peaks_i=pi,
         spacings_recorded=sp, spacings_calibrated=sp * cal,
-        v_factor=cal, config=dict(cfg),
+        v_factor=cal, peaks_v_err=peaks_err, spacings_err=spac_err,
+        config=dict(cfg),
     )
 
     if plots:
