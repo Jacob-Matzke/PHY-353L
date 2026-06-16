@@ -1,104 +1,133 @@
 ==============================================================================
  H2D2  -  Hydrogen / Deuterium Balmer-alpha analysis summary
- generated 2026-06-16 13:47:10
+ generated 2026-06-16 14:16:48
 ==============================================================================
 
- MODEL   I(lambda) = B + m*lambda
-                   + A_H*exp(-(lambda-lambda_H)^2 / (2 sigma_H^2))
-                   + A_D*exp(-(lambda-lambda_D)^2 / (2 sigma_D^2))
-         fit window 655.0-657.0 nm;  H = longer-wavelength line.
+ MODEL   I(lambda) = B + m*lambda + A_H*V(lambda-lambda_H; sigma,gamma)
+                                  + A_D*V(lambda-lambda_D; sigma,gamma)
+         V = Voigt (Gaussian Doppler/instrument (x) Lorentzian
+         lifetime/pressure); sigma and gamma shared across H,D.
+         line shape: voigt;  fit window 654.5-656.4 nm;  H = longer-wavelength line.
 
 ------------------------------------------------------------------------------
  HELIUM WAVELENGTH-OFFSET CALIBRATION
 ------------------------------------------------------------------------------
   NIST He I reference : 667.81517 nm (+/- 1e-04)
-  fit window          : 667.0-667.55 nm  (single Gaussian + linear background)
+  fit window          : 667.0-667.55 nm  (single voigt + linear background)
 
   trial                            center (raw, nm)  chi2/dof  offset (nm)
-  HR4C25001_14-21-45-263         667.2774 +/- 0.0015      12.6      +0.5378
-  HR4C25001_14-22-03-715         667.2775 +/- 0.0015      12.3      +0.5377
-  HR4C25001_14-22-18-299         667.2775 +/- 0.0015      12.4      +0.5377
+  HR4C25001_14-21-45-263         667.2758 +/- 0.0012       8.1      +0.5393
+  HR4C25001_14-22-03-715         667.2759 +/- 0.0012       7.9      +0.5393
+  HR4C25001_14-22-18-299         667.2759 +/- 0.0012       8.0      +0.5393
 
-  combined He center  : 667.2774 +/- 0.0009 nm  (trial scatter 0.0000 nm)
-  APPLIED OFFSET      : +0.5377 +/- 0.0009 nm   (added to every wavelength)
+  He line widths      : Gaussian sigma 0.0010 nm,  Lorentzian gamma 0.0231 nm
+  combined He center  : 667.2759 +/- 0.0007 nm  (trial scatter 0.0000 nm)
+  APPLIED OFFSET      : +0.5393 +/- 0.0007 nm   (added to every wavelength)
   note: a constant offset cancels in Delta lambda; it fixes the
         ABSOLUTE centers and contributes the offset_err to them.
 
 ------------------------------------------------------------------------------
  PER-TRIAL H2D2 FITS   (wavelengths are offset-corrected / measured)
 ------------------------------------------------------------------------------
- Trial 1
-   background : B = -18295.449 counts,  m = 27.9755 counts/nm
-   H-alpha    : A = 8367.5 counts,  sigma = 0.0373 nm
-   D-alpha    : A = 8728.4 counts,  sigma = 0.0329 nm
-   lambda_H   : 656.1600 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9820 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1780 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 236.07   (points 138, converged True)
+ Trial 1  [voigt]
+   background : B = 42319.817 counts,  m = -64.6472 counts/nm
+   H-alpha    : A = 9555.4 counts
+   D-alpha    : A = 9217.0 counts
+   widths     : Gaussian sigma = 0.0126 nm (FWHM 0.0298), Lorentzian gamma = 0.0253 nm  [shared H,D]
+   lambda_H   : 656.1595 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9806 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1788 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 0.97   (points 130, converged True)
 
- Trial 2
-   background : B = -18110.710 counts,  m = 27.6895 counts/nm
-   H-alpha    : A = 8323.9 counts,  sigma = 0.0374 nm
-   D-alpha    : A = 8716.3 counts,  sigma = 0.0331 nm
-   lambda_H   : 656.1601 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9824 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1777 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 242.90   (points 138, converged True)
+ Trial 2  [voigt]
+   background : B = 44148.128 counts,  m = -67.4395 counts/nm
+   H-alpha    : A = 9471.6 counts
+   D-alpha    : A = 9185.3 counts
+   widths     : Gaussian sigma = 0.0131 nm (FWHM 0.0310), Lorentzian gamma = 0.0252 nm  [shared H,D]
+   lambda_H   : 656.1597 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9811 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1786 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 0.99   (points 130, converged True)
 
- Trial 3
-   background : B = -17167.620 counts,  m = 26.2536 counts/nm
-   H-alpha    : A = 8169.4 counts,  sigma = 0.0378 nm
-   D-alpha    : A = 8872.8 counts,  sigma = 0.0332 nm
-   lambda_H   : 656.1600 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9824 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1776 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 257.65   (points 138, converged True)
+ Trial 3  [voigt]
+   background : B = 43874.895 counts,  m = -67.0196 counts/nm
+   H-alpha    : A = 9333.2 counts
+   D-alpha    : A = 9367.5 counts
+   widths     : Gaussian sigma = 0.0129 nm (FWHM 0.0305), Lorentzian gamma = 0.0254 nm  [shared H,D]
+   lambda_H   : 656.1595 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9810 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1784 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 1.01   (points 130, converged True)
 
- Trial 4
-   background : B = -17701.848 counts,  m = 27.0672 counts/nm
-   H-alpha    : A = 8146.4 counts,  sigma = 0.0378 nm
-   D-alpha    : A = 8861.3 counts,  sigma = 0.0331 nm
-   lambda_H   : 656.1599 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9821 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1778 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 259.11   (points 138, converged True)
+ Trial 4  [voigt]
+   background : B = 43454.390 counts,  m = -66.3798 counts/nm
+   H-alpha    : A = 9324.1 counts
+   D-alpha    : A = 9362.1 counts
+   widths     : Gaussian sigma = 0.0128 nm (FWHM 0.0300), Lorentzian gamma = 0.0255 nm  [shared H,D]
+   lambda_H   : 656.1593 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9807 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1786 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 1.01   (points 130, converged True)
 
- Trial 5
-   background : B = -17468.950 counts,  m = 26.7112 counts/nm
-   H-alpha    : A = 8079.4 counts,  sigma = 0.0378 nm
-   D-alpha    : A = 8596.8 counts,  sigma = 0.0329 nm
-   lambda_H   : 656.1597 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9818 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1779 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 255.61   (points 138, converged True)
+ Trial 5  [voigt]
+   background : B = 41588.929 counts,  m = -63.5302 counts/nm
+   H-alpha    : A = 9248.7 counts
+   D-alpha    : A = 9050.2 counts
+   widths     : Gaussian sigma = 0.0128 nm (FWHM 0.0302), Lorentzian gamma = 0.0254 nm  [shared H,D]
+   lambda_H   : 656.1591 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9805 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1786 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 0.96   (points 130, converged True)
 
- Trial 6
-   background : B = -17584.965 counts,  m = 26.8882 counts/nm
-   H-alpha    : A = 8230.7 counts,  sigma = 0.0378 nm
-   D-alpha    : A = 8675.9 counts,  sigma = 0.0331 nm
-   lambda_H   : 656.1600 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9823 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1777 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 254.35   (points 138, converged True)
+ Trial 6  [voigt]
+   background : B = 41705.233 counts,  m = -63.7080 counts/nm
+   H-alpha    : A = 9385.0 counts
+   D-alpha    : A = 9116.0 counts
+   widths     : Gaussian sigma = 0.0133 nm (FWHM 0.0314), Lorentzian gamma = 0.0252 nm  [shared H,D]
+   lambda_H   : 656.1594 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9809 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1785 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 0.95   (points 130, converged True)
 
- Trial 7
-   background : B = -17758.246 counts,  m = 27.1523 counts/nm
-   H-alpha    : A = 8347.4 counts,  sigma = 0.0381 nm
-   D-alpha    : A = 8732.3 counts,  sigma = 0.0331 nm
-   lambda_H   : 656.1603 +/- 0.0042 nm (fit 0.0013, cal 0.0040)
-   lambda_D   : 655.9823 +/- 0.0041 nm (fit 0.0012, cal 0.0040)
-   Delta lam  : 0.1780 +/- 0.0017 nm (fit 0.0017, cal 1.0e-06)
-   chi2/dof   : 252.25   (points 138, converged True)
+ Trial 7  [voigt]
+   background : B = 41595.517 counts,  m = -63.5421 counts/nm
+   H-alpha    : A = 9537.4 counts
+   D-alpha    : A = 9157.9 counts
+   widths     : Gaussian sigma = 0.0133 nm (FWHM 0.0312), Lorentzian gamma = 0.0253 nm  [shared H,D]
+   lambda_H   : 656.1596 +/- 0.0040 nm (fit 0.0010, cal 0.0039)
+   lambda_D   : 655.9810 +/- 0.0041 nm (fit 0.0010, cal 0.0039)
+   Delta lam  : 0.1786 +/- 0.0014 nm (fit 0.0014, cal 1.1e-06)
+   chi2/dof   : 0.93   (points 130, converged True)
 
 ------------------------------------------------------------------------------
  COMBINED RESULT   (7 trials)
 ------------------------------------------------------------------------------
   rel. calibration (scale) error : 5.89e-06
-  helium offset error            : 0.0009 nm
-  lambda_H     = 656.1600 +/- 0.0040 nm (stat 0.0005, cal 4.0e-03, read 5.0e-06)
-  lambda_D     = 655.9822 +/- 0.0040 nm (stat 0.0004, cal 4.0e-03, read 5.0e-06)
-  Delta lambda = 0.1778 +/- 0.0007 nm (stat 0.0007, cal 1.0e-06, read 7.1e-06)
-  plain mean Delta lambda = 0.1778 +/- 0.0001 nm (SEM);  scatter 0.0001 nm
+  helium offset error            : 0.0007 nm
+  lambda_H     = 656.1594 +/- 0.0039 nm (stat 0.0004, cal 3.9e-03, read 5.0e-06)
+  lambda_D     = 655.9808 +/- 0.0039 nm (stat 0.0004, cal 3.9e-03, read 5.0e-06)
+  Delta lambda = 0.1786 +/- 0.0005 nm (stat 0.0005, cal 1.1e-06, read 7.1e-06)
+  plain mean Delta lambda = 0.1786 +/- 0.0000 nm (SEM);  scatter 0.0001 nm
 
   literature : lambda_H 656.2790, lambda_D 656.1000, Delta lambda 0.1790 nm
+
+------------------------------------------------------------------------------
+ LINE-SHAPE WIDTHS & DOPPLER TEMPERATURE  (shared Voigt, mean over trials)
+------------------------------------------------------------------------------
+  Gaussian sigma (Doppler+instrument) : 0.0130 nm (FWHM 0.0306 nm)
+  Lorentzian gamma (lifetime+pressure): 0.0253 nm (FWHM 0.0506 nm)
+  Voigt FWHM                          : 0.0657 nm
+  instrumental sigma (from He line)   : 0.0010 nm
+  Doppler sigma (H, deconvolved)      : 0.0129 nm  ->  T ~ 4243 K (ROUGH UPPER ESTIMATE -- see note)
+  notes:
+   - the natural (lifetime) Lorentzian for H-alpha is ~1e-4 nm, far
+     below resolution: the fitted gamma is pressure/instrument, not
+     the lifetime.
+   - the He line is asymmetric (red tail) and the symmetric Voigt
+     puts almost all its width into gamma, leaving its Gaussian sigma
+     ~0. So sigma_inst is poorly determined and the Doppler T is a
+     model-dependent UPPER estimate (the H Gaussian width also
+     contains unresolved Stark/instrument structure, not pure thermal).
+     A clean T needs a symmetric, well-resolved calibration line.
+
 ==============================================================================

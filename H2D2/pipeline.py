@@ -42,6 +42,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
+from scipy.special import voigt_profile
+
+# physical constants (SI) for the Doppler-temperature readout
+_C_LIGHT = 2.99792458e8        # m/s
+_K_BOLTZ = 1.380649e-23        # J/K
+_AMU = 1.66053906660e-27       # kg
+_M_H = 1.007825 * _AMU         # hydrogen atom mass
+_M_HE = 4.002602 * _AMU        # helium atom mass
 
 
 # --------------------------------------------------------------------------- #
@@ -126,8 +134,21 @@ CONFIG = {
         # into one broad blob.
         "sigma_min": 0.01,              # nm
         "sigma_max": 0.30,              # nm
+        # Voigt-only: Lorentzian (lifetime + pressure) HWHM start and bound.
+        # The natural width is ~1e-4 nm (unresolvable here), so a free gamma
+        # mostly captures pressure/instrumental wings -- see notes in fit_spectrum.
+        "gamma_guess": 0.01,            # nm
+        "gamma_max": 0.30,              # nm
         "maxfev": 20000,
     },
+
+    # --- line shape ------------------------------------------------------- #
+    # "voigt"   : background + two Voigt peaks (Gaussian Doppler/instrument
+    #             convolved with Lorentzian lifetime/pressure); shared sigma and
+    #             gamma across the H/D doublet. The physically-motivated choice.
+    # "gaussian": background + two independent Gaussians (the simpler model).
+    # The helium calibration line uses the SAME shape for consistency.
+    "lineshape": "voigt",
 
     # --- expected physics (annotation only) ------------------------------- #
     # literature H-alpha / D-alpha and their separation (nm), shown on plots.
@@ -152,7 +173,7 @@ class FitResult:
     intensity: np.ndarray
     fit_wl: np.ndarray                # cropped window actually fitted
     fit_i: np.ndarray
-    popt: np.ndarray                  # [B, m, A_H, lamH, sigH, A_D, lamD, sigD]
+    popt: np.ndarray                  # raw fitted parameter vector (model-dependent)
     pcov: np.ndarray
     lambda_H: float
     lambda_D: float
@@ -162,6 +183,11 @@ class FitResult:
     lambda_D_err: float
     dlambda_err: float
     chi2_dof: float
+    # canonical unpacked parameters (always B,m,A_H,lambda_H,sigma_H,gamma_H,...):
+    pdict: dict = field(default_factory=dict)
+    lineshape: str = "gaussian"
+    sigma_gauss: float = float("nan")  # shared/representative Gaussian width (nm)
+    gamma_lor: float = 0.0             # shared Lorentzian HWHM (nm; 0 for gaussian)
     # --- uncertainty breakdown (so the budget is transparent) ------------- #
     # statistical, from the weighted fit covariance (independent per trial):
     lambda_H_err_fit: float = float("nan")
@@ -177,15 +203,29 @@ class FitResult:
 
     @property
     def params(self) -> dict:
-        B, m, A_H, lamH, sigH, A_D, lamD, sigD = self.popt
-        return {"B": B, "m": m,
-                "A_H": A_H, "lambda_H": lamH, "sigma_H": sigH,
-                "A_D": A_D, "lambda_D": lamD, "sigma_D": sigD}
+        return self.pdict
+
+    def model(self, x):
+        """Evaluate the fitted curve (background + both peaks) at x."""
+        p = self.pdict
+        return (p["B"] + p["m"] * x
+                + peak_profile(self.lineshape, x, p["A_H"], p["lambda_H"],
+                               p["sigma_H"], p["gamma_H"])
+                + peak_profile(self.lineshape, x, p["A_D"], p["lambda_D"],
+                               p["sigma_D"], p["gamma_D"]))
 
     def summary(self) -> str:
-        p = self.params
+        if self.lineshape == "voigt":
+            wline = (f"  widths (shared)  : Gaussian sigma {self.sigma_gauss:.4f} nm "
+                     f"(FWHM {fwhm_gauss(self.sigma_gauss):.4f}), "
+                     f"Lorentzian gamma {self.gamma_lor:.4f} nm "
+                     f"(FWHM_V {fwhm_voigt(self.sigma_gauss, self.gamma_lor):.4f})")
+        else:
+            p = self.pdict
+            wline = (f"  peak widths sigma : H {p['sigma_H']:.4f} nm,  "
+                     f"D {p['sigma_D']:.4f} nm")
         lines = [
-            f"Run: {self.run}",
+            f"Run: {self.run}  [{self.lineshape}]",
             f"  fit window       : {self.fit_wl.min():.3f} - {self.fit_wl.max():.3f} nm "
             f"({len(self.fit_wl)} pts)",
             f"  converged        : {self.success}   chi2/dof = {self.chi2_dof:.2f}",
@@ -195,7 +235,7 @@ class FitResult:
             f"(fit {self.lambda_D_err_fit:.4f}, cal {self.lambda_D_err_cal:.4f})",
             f"  Delta lambda      : {self.dlambda:.4f} +/- {self.dlambda_err:.4f} nm "
             f"(fit {self.dlambda_err_fit:.4f}, cal {self.dlambda_err_cal:.1e})",
-            f"  peak widths sigma : H {p['sigma_H']:.4f} nm,  D {p['sigma_D']:.4f} nm",
+            wline,
         ]
         return "\n".join(lines)
 
@@ -213,11 +253,14 @@ class OffsetResult:
     offset: float                     # nist_line - center_combined  (nm, ADD to lambda)
     offset_err: float                 # total 1-sigma of the offset (nm)
     offset_scatter: float             # std of per-trial offsets (nm)
+    lineshape: str = "gaussian"       # shape used for the He center fit
+    sigma_he: float = float("nan")    # mean He Gaussian width sigma (nm)
+    gamma_he: float = 0.0             # mean He Lorentzian HWHM gamma (nm)
     fits: list = field(default_factory=list)   # (wl, it, popt) per trial, for plots
 
     def summary(self) -> str:
         lines = [
-            "Helium wavelength-offset calibration",
+            f"Helium wavelength-offset calibration  [{self.lineshape}]",
             f"  NIST He I line   : {self.nist_line:.5f} nm",
             f"  trials           : {len(self.centers)}",
         ]
@@ -349,19 +392,30 @@ def fit_helium_line(df: pd.DataFrame, cfg: dict = CONFIG):
     lam0 = float(wl[np.argmax(it)])
     A0 = max(float(it.max() - B0), 1.0)
     sig0 = float(hc.get("sigma_guess", 0.02))
-    p0 = [B0, 0.0, A0, lam0, sig0]
-    bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3],
-              [np.inf, np.inf, np.inf, hi, 0.3])
-    popt, pcov = curve_fit(one_gaussian, wl, it, p0=p0, bounds=bounds,
-                           absolute_sigma=False, maxfev=cfg["fit"]["maxfev"])
+    shape = _lineshape(cfg)
+    f = cfg["fit"]
+    if shape == "voigt":
+        func = one_voigt
+        p0 = [B0, 0.0, A0, lam0, sig0, f.get("gamma_guess", 0.01)]
+        bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3, 0.0],
+                  [np.inf, np.inf, np.inf, hi, f["sigma_max"], f["gamma_max"]])
+    else:
+        func = one_gaussian
+        p0 = [B0, 0.0, A0, lam0, sig0]
+        bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3],
+                  [np.inf, np.inf, np.inf, hi, f["sigma_max"]])
+    popt, pcov = curve_fit(func, wl, it, p0=p0, bounds=bounds,
+                           absolute_sigma=False, maxfev=f["maxfev"])
     perr = np.sqrt(np.diag(pcov))
     center, center_err = float(popt[3]), float(perr[3])
+    sigma = float(popt[4])
+    gamma = float(popt[5]) if shape == "voigt" else 0.0
 
-    resid = it - one_gaussian(wl, *popt)
+    resid = it - func(wl, *popt)
     dof = max(1, len(wl) - len(popt))
     noise = float(np.std(np.concatenate([resid[:edge], resid[-edge:]]))) or 1.0
     chi2_dof = float(np.sum((resid / noise) ** 2) / dof)
-    return center, center_err, chi2_dof, popt, wl, it
+    return center, center_err, chi2_dof, sigma, gamma, popt, wl, it
 
 
 def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResult:
@@ -380,11 +434,12 @@ def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResul
     if not files:
         raise FileNotFoundError(f"no helium spectra in {hc['data_root']!r}")
 
-    names, centers, cerr, chi, fits = [], [], [], [], []
+    names, centers, cerr, chi, sigmas, gammas, fits = [], [], [], [], [], [], []
     for f in files:
         df = load_spectrum(f, cfg, calibrate=False)     # raw recorded wavelengths
-        c, e, x, popt, wl, it = fit_helium_line(df, cfg)
+        c, e, x, sg, gm, popt, wl, it = fit_helium_line(df, cfg)
         names.append(_run_name(f)); centers.append(c); cerr.append(e); chi.append(x)
+        sigmas.append(sg); gammas.append(gm)
         fits.append((wl, it, popt))
     centers = np.array(centers); cerr = np.array(cerr); chi = np.array(chi)
 
@@ -397,7 +452,9 @@ def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResul
     res = OffsetResult(
         nist_line=nist, trial_names=names, centers=centers, centers_err=cerr,
         chi2_dof=chi, center_combined=center_comb, center_combined_err=center_comb_err,
-        offset=offset, offset_err=offset_err, offset_scatter=comb["std"], fits=fits,
+        offset=offset, offset_err=offset_err, offset_scatter=comb["std"],
+        lineshape=_lineshape(cfg), sigma_he=float(np.mean(sigmas)),
+        gamma_he=float(np.mean(gammas)), fits=fits,
     )
     if apply:
         cal = cfg["calibration"]
@@ -435,6 +492,58 @@ def one_gaussian(lmbda, B, m, A, lam0, sig):
     return B + m * lmbda + A * np.exp(-((lmbda - lam0) ** 2) / (2.0 * sig ** 2))
 
 
+def _voigt_peak(dl, sigma, gamma):
+    """Height-normalized Voigt (value 1 at dl=0): the area-normalized
+    scipy Voigt divided by its peak, so the amplitude A is the PEAK HEIGHT
+    (counts), directly comparable to the Gaussian model's amplitude."""
+    return voigt_profile(dl, sigma, gamma) / voigt_profile(0.0, sigma, gamma)
+
+
+def two_voigt(lmbda, B, m, A_H, lam_H, A_D, lam_D, sigma, gamma):
+    """Sloped background plus two Voigt peaks sharing the Gaussian width sigma
+    (Doppler + instrument) and the Lorentzian HWHM gamma (lifetime + pressure)."""
+    return (B + m * lmbda
+            + A_H * _voigt_peak(lmbda - lam_H, sigma, gamma)
+            + A_D * _voigt_peak(lmbda - lam_D, sigma, gamma))
+
+
+def one_voigt(lmbda, B, m, A, lam0, sigma, gamma):
+    """Sloped background plus a single Voigt peak (the helium-line model)."""
+    return B + m * lmbda + A * _voigt_peak(lmbda - lam0, sigma, gamma)
+
+
+def _lineshape(cfg: dict) -> str:
+    return str(cfg.get("lineshape", "gaussian")).lower()
+
+
+def peak_profile(lineshape, lmbda, A, lam0, sigma, gamma):
+    """Evaluate a single line's contribution (peak height A) for either shape."""
+    if lineshape == "voigt":
+        return A * _voigt_peak(lmbda - lam0, sigma, gamma)
+    return A * np.exp(-((lmbda - lam0) ** 2) / (2.0 * sigma ** 2))
+
+
+def fwhm_gauss(sigma: float) -> float:
+    return float(2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma)
+
+
+def fwhm_voigt(sigma: float, gamma: float) -> float:
+    """Olivero-Longbothum approximation for the Voigt FWHM (nm)."""
+    fG = fwhm_gauss(sigma)
+    fL = 2.0 * gamma
+    return float(0.5346 * fL + np.sqrt(0.2166 * fL ** 2 + fG ** 2))
+
+
+def doppler_temperature(sigma_doppler_nm: float, lambda0_nm: float,
+                        mass_kg: float = _M_H) -> float:
+    """Gas temperature (K) implied by a Gaussian Doppler width sigma (nm):
+        sigma/lambda = sqrt(kT / (m c^2))  ->  T = (sigma c / lambda)^2 m / k."""
+    if sigma_doppler_nm <= 0:
+        return float("nan")
+    frac = sigma_doppler_nm / lambda0_nm
+    return float((frac * _C_LIGHT) ** 2 * mass_kg / _K_BOLTZ)
+
+
 def initial_guess(wl: np.ndarray, it: np.ndarray, cfg: dict = CONFIG):
     """Build (p0, lower, upper) for curve_fit from the cropped data.
 
@@ -465,10 +574,18 @@ def initial_guess(wl: np.ndarray, it: np.ndarray, cfg: dict = CONFIG):
     a2 = max(a2, 0.05 * rng)
     sig = f["sigma_guess"]
 
-    #     [ B,      m,    A1,      lam1, sig1, A2,      lam2, sig2 ]
-    p0 = [B0, 0.0, a1, c1, sig, a2, c2, sig]
-    lower = [-np.inf, -np.inf, 0.0, lo, f["sigma_min"], 0.0, lo, f["sigma_min"]]
-    upper = [np.inf, np.inf, np.inf, hi, f["sigma_max"], np.inf, hi, f["sigma_max"]]
+    if _lineshape(cfg) == "voigt":
+        gam = f.get("gamma_guess", 0.01)
+        #     [ B,    m,   A1, lam1, A2, lam2, sigma,         gamma ]
+        p0 = [B0, 0.0, a1, c1, a2, c2, sig, gam]
+        lower = [-np.inf, -np.inf, 0.0, lo, 0.0, lo, f["sigma_min"], 0.0]
+        upper = [np.inf, np.inf, np.inf, hi, np.inf, hi,
+                 f["sigma_max"], f["gamma_max"]]
+    else:
+        #     [ B,    m,   A1, lam1, sig1, A2, lam2, sig2 ]
+        p0 = [B0, 0.0, a1, c1, sig, a2, c2, sig]
+        lower = [-np.inf, -np.inf, 0.0, lo, f["sigma_min"], 0.0, lo, f["sigma_min"]]
+        upper = [np.inf, np.inf, np.inf, hi, f["sigma_max"], np.inf, hi, f["sigma_max"]]
     return p0, (lower, upper)
 
 
@@ -495,7 +612,12 @@ def readout_center_floor(wl: np.ndarray, it: np.ndarray, cfg: dict) -> float:
 
 
 def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
-    """Crop to the doublet window and fit the two-Gaussian model.
+    """Crop to the doublet window and fit the configured line shape.
+
+    Line shape (CONFIG["lineshape"]):
+      - "voigt"    : two Voigt peaks sharing the Gaussian width sigma (Doppler +
+                     instrument) and Lorentzian HWHM gamma (lifetime + pressure).
+      - "gaussian" : two independent Gaussians.
 
     Uncertainty propagation (each term reported separately, summed in quadrature):
       - FIT (statistical): the model is fit with UNIFORM weighting -- correct
@@ -503,17 +625,19 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         unbiased (max-likelihood) estimator; weighting by the tiny readout floor
         instead would pathologically up-weight the flat baseline and bias the
         centers. The center covariance is read off pcov with absolute_sigma=False,
-        so the error SCALE is set by the actual residuals (real shot noise + the
-        slight non-Gaussian line wings), which is the honest statistical error.
+        so the error SCALE is set by the actual residuals (real shot noise + any
+        residual line-shape mismatch), which is the honest statistical error.
         Delta lambda uses the full covariance var(lamH)+var(lamD)-2cov(lamH,lamD).
       - READOUT: +/- 1/2 last decimal. The wavelength readout is a per-center
         floor (sigma_wl); the intensity readout's center contribution
         (readout_center_floor) is tracked but dominated -- both fold into the
         total in quadrature.
       - CALIBRATION (systematic): the OceanView pixel->wavelength fit accuracy
-        as a fractional (scale) error rel_cal; common-mode across trials, and it
-        nearly cancels in Delta lambda (offset cancels, only the scale remains).
+        as a fractional (scale) error rel_cal plus the helium-offset error;
+        common-mode across trials, and nearly cancels in Delta lambda.
     """
+    shape = _lineshape(cfg)
+    model = two_voigt if shape == "voigt" else two_gaussian
     win = crop(df, cfg)
     wl = win["wavelength"].to_numpy(dtype=float)
     it = win["intensity"].to_numpy(dtype=float)
@@ -524,7 +648,7 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     p0, bounds = initial_guess(wl, it, cfg)
     success = True
     try:
-        popt, pcov = curve_fit(two_gaussian, wl, it, p0=p0, bounds=bounds,
+        popt, pcov = curve_fit(model, wl, it, p0=p0, bounds=bounds,
                                absolute_sigma=False, maxfev=cfg["fit"]["maxfev"])
     except Exception as exc:  # keep the run; flag it as not converged
         print(f"  [warn] fit failed for {run!r}: {exc}")
@@ -534,9 +658,11 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
 
     perr = np.sqrt(np.diag(pcov))
 
+    # center parameter positions in popt: voigt [.,.,A1,lam1,A2,lam2,sig,gam],
+    # gaussian [.,.,A1,lam1,sig1,A2,lam2,sig2]
+    c1, c2 = (3, 5) if shape == "voigt" else (3, 6)
     # assign H (longer wavelength) vs D (shorter) from the fitted centers
-    lam1, lam2 = popt[3], popt[6]
-    i_hi, i_lo = (3, 6) if lam1 >= lam2 else (6, 3)
+    i_hi, i_lo = (c1, c2) if popt[c1] >= popt[c2] else (c2, c1)
     lambda_H, lambda_D = popt[i_hi], popt[i_lo]
     lamH_fit, lamD_fit = perr[i_hi], perr[i_lo]
     dlambda = lambda_H - lambda_D
@@ -545,11 +671,18 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     var = pcov[i_hi, i_hi] + pcov[i_lo, i_lo] - 2.0 * pcov[i_hi, i_lo]
     dl_fit = float(np.sqrt(var)) if np.isfinite(var) and var > 0 else float("nan")
 
-    # reorder popt so params property always reports H then D consistently
-    B, m = popt[0], popt[1]
-    A_H, sig_H = popt[i_hi - 1], popt[i_hi + 1]
-    A_D, sig_D = popt[i_lo - 1], popt[i_lo + 1]
-    popt_ordered = np.array([B, m, A_H, lambda_H, sig_H, A_D, lambda_D, sig_D])
+    # unpack widths/amplitudes (amplitude index = center-1 for both shapes)
+    B, m = float(popt[0]), float(popt[1])
+    A_H, A_D = float(popt[i_hi - 1]), float(popt[i_lo - 1])
+    if shape == "voigt":
+        sig_H = sig_D = float(popt[6])       # shared Gaussian width
+        gam_H = gam_D = float(popt[7])       # shared Lorentzian HWHM
+    else:
+        sig_H, sig_D = float(popt[i_hi + 1]), float(popt[i_lo + 1])
+        gam_H = gam_D = 0.0
+    pdict = {"B": B, "m": m,
+             "A_H": A_H, "lambda_H": float(lambda_H), "sigma_H": sig_H, "gamma_H": gam_H,
+             "A_D": A_D, "lambda_D": float(lambda_D), "sigma_D": sig_D, "gamma_D": gam_D}
 
     # calibration systematic (common-mode across trials). Two pieces hit the
     # ABSOLUTE centers: the fractional dispersion/scale error (from R^2) and the
@@ -574,7 +707,7 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     lambda_D_err = _tot(lamD_fit, lamD_cal, 1.0)
     dlambda_err = _tot(dl_fit, dl_cal, np.sqrt(2.0))
 
-    resid = it - two_gaussian(wl, *popt)
+    resid = it - model(wl, *popt)
     dof = max(1, len(wl) - len(popt))
     # noise estimate from the flat background tails (robust to the peaks)
     edge = max(3, len(it) // 10)
@@ -586,9 +719,11 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         wavelength=df["wavelength"].to_numpy(dtype=float),
         intensity=df["intensity"].to_numpy(dtype=float),
         fit_wl=wl, fit_i=it,
-        popt=popt_ordered, pcov=pcov,
+        popt=np.asarray(popt, dtype=float), pcov=pcov,
         lambda_H=float(lambda_H), lambda_D=float(lambda_D), dlambda=float(dlambda),
         lambda_H_err=lambda_H_err, lambda_D_err=lambda_D_err, dlambda_err=dlambda_err,
+        pdict=pdict, lineshape=shape,
+        sigma_gauss=0.5 * (sig_H + sig_D), gamma_lor=gam_H,
         lambda_H_err_fit=float(lamH_fit), lambda_D_err_fit=float(lamD_fit),
         dlambda_err_fit=dl_fit,
         lambda_H_err_cal=float(lamH_cal), lambda_D_err_cal=float(lamD_cal),
@@ -644,19 +779,20 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
     out = save_path or os.path.join(cfg["save_dir"], f"{_slug(result.run)}_fit.png")
     _ensure_dir(os.path.dirname(out) or ".")
     p = result.params
+    ls = result.lineshape
     wl, it = result.fit_wl, result.fit_i
     grid = np.linspace(wl.min(), wl.max(), 1000)
-    model = two_gaussian(grid, *result.popt)
+    model = result.model(grid)
     bg = p["B"] + p["m"] * grid
-    gH = bg + p["A_H"] * np.exp(-((grid - p["lambda_H"]) ** 2) / (2 * p["sigma_H"] ** 2))
-    gD = bg + p["A_D"] * np.exp(-((grid - p["lambda_D"]) ** 2) / (2 * p["sigma_D"] ** 2))
+    gH = bg + peak_profile(ls, grid, p["A_H"], p["lambda_H"], p["sigma_H"], p["gamma_H"])
+    gD = bg + peak_profile(ls, grid, p["A_D"], p["lambda_D"], p["sigma_D"], p["gamma_D"])
 
     fig, (ax, axr) = plt.subplots(
         2, 1, figsize=(9, 6.5), sharex=True,
         gridspec_kw={"height_ratios": [3, 1], "hspace": 0.05})
 
     ax.scatter(wl, it, s=10, color="0.35", alpha=0.7, label="data", zorder=2)
-    ax.plot(grid, model, color="C3", lw=2.0, label="two-Gaussian fit", zorder=4)
+    ax.plot(grid, model, color="C3", lw=2.0, label=f"two-{ls} fit", zorder=4)
     ax.plot(grid, gH, color="C0", lw=1.2, ls="--", label="H-alpha component")
     ax.plot(grid, gD, color="C2", lw=1.2, ls="--", label="D-alpha component")
     ax.plot(grid, bg, color="0.6", lw=1.0, ls=":", label="background")
@@ -671,14 +807,17 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
            f"   (fit {result.dlambda_err_fit:.4f}, cal {result.dlambda_err_cal:.0e})\n"
            f"(lit. {cfg.get('dlambda_lit', float('nan')):.3f} nm)\n"
            f"$\\chi^2$/dof = {result.chi2_dof:.2f}")
+    if result.lineshape == "voigt":
+        txt += (f"\n$\\sigma_G$={result.sigma_gauss:.4f}, "
+                f"$\\gamma_L$={result.gamma_lor:.4f} nm")
     ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
     ax.set_ylabel("Intensity (counts)")
-    ax.set_title(f"{result.run}: H-alpha / D-alpha doublet fit")
+    ax.set_title(f"{result.run}: H-alpha / D-alpha doublet fit ({result.lineshape})")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right", fontsize=8)
 
-    resid = it - two_gaussian(wl, *result.popt)
+    resid = it - result.model(wl)
     axr.axhline(0, color="0.6", lw=0.8)
     axr.scatter(wl, resid, s=8, color="C3", alpha=0.7)
     axr.set_xlabel("Wavelength (nm)")
@@ -698,6 +837,7 @@ def plot_helium(offset: OffsetResult, cfg: dict = CONFIG,
     fitted centers, annotated with the measured offset."""
     out = save_path or os.path.join(cfg["save_dir"], "helium_offset.png")
     _ensure_dir(os.path.dirname(out) or ".")
+    he_model = one_voigt if offset.lineshape == "voigt" else one_gaussian
     fig, ax = plt.subplots(figsize=(9, 5))
     cmap = plt.get_cmap("tab10")
     for k, ((wl, it, popt), name, c) in enumerate(
@@ -705,7 +845,7 @@ def plot_helium(offset: OffsetResult, cfg: dict = CONFIG,
         color = cmap(k % 10)
         ax.scatter(wl, it, s=8, alpha=0.4, color=color)
         grid = np.linspace(wl.min(), wl.max(), 800)
-        ax.plot(grid, one_gaussian(grid, *popt), lw=1.4, color=color,
+        ax.plot(grid, he_model(grid, *popt), lw=1.4, color=color,
                 label=f"{name}: center {c:.4f} nm")
         ax.axvline(c, color=color, ls="--", lw=0.8, alpha=0.6)
     ax.axvline(offset.nist_line, color="k", lw=1.6, ls="-",
@@ -814,6 +954,44 @@ def combine_runs(results: dict, cfg: dict = CONFIG) -> dict:
     return out
 
 
+def physical_widths(results: dict, offset: Optional[OffsetResult] = None,
+                    cfg: dict = CONFIG) -> dict:
+    """Decompose the (Voigt) line widths into their physical contributions.
+
+    The shared Gaussian width sigma_G combines instrument + Doppler in quadrature;
+    using the helium line as the instrumental width proxy (its own Doppler is only
+    ~half of hydrogen's and is neglected here), the Doppler width and the implied
+    gas temperature follow from sigma_Doppler^2 = sigma_G^2 - sigma_inst^2 and
+    T = (sigma_Doppler c / lambda)^2 m_H / k. The Lorentzian width gamma is the
+    lifetime + pressure contribution (natural part ~1e-4 nm is unresolvable here).
+    Returns NaNs gracefully if widths are unavailable or the subtraction is
+    negative (instrument already broader than the H line).
+    """
+    good = [r for r in results.values() if r.success]
+    if not good:
+        return {}
+    sig_G = float(np.mean([r.sigma_gauss for r in good]))
+    gam_L = float(np.mean([r.gamma_lor for r in good]))
+    lam = float(np.mean([r.lambda_H for r in good]))
+    out = {
+        "lineshape": _lineshape(cfg),
+        "sigma_gauss": sig_G, "fwhm_gauss": fwhm_gauss(sig_G),
+        "gamma_lor": gam_L, "fwhm_lor": 2.0 * gam_L,
+        "fwhm_voigt": fwhm_voigt(sig_G, gam_L),
+        "sigma_inst": float("nan"), "sigma_doppler": float("nan"),
+        "T_doppler": float("nan"),
+    }
+    if offset is not None and np.isfinite(offset.sigma_he) and offset.sigma_he > 0:
+        sig_inst = float(offset.sigma_he)        # He line ~ instrumental width
+        out["sigma_inst"] = sig_inst
+        d2 = sig_G ** 2 - sig_inst ** 2
+        if d2 > 0:
+            sig_dopp = float(np.sqrt(d2))
+            out["sigma_doppler"] = sig_dopp
+            out["T_doppler"] = doppler_temperature(sig_dopp, lam, _M_H)
+    return out
+
+
 def _weighted_combine(vals: np.ndarray, errs: np.ndarray) -> dict:
     """Inverse-variance weighted mean with Birge-ratio inflation, plus the
     plain mean / standard error for reference."""
@@ -857,11 +1035,19 @@ def write_report(results: dict, cfg: dict = CONFIG,
     L.append(f" generated {datetime.now():%Y-%m-%d %H:%M:%S}")
     L.append(bar)
     L.append("")
-    L.append(" MODEL   I(lambda) = B + m*lambda")
-    L.append("                   + A_H*exp(-(lambda-lambda_H)^2 / (2 sigma_H^2))")
-    L.append("                   + A_D*exp(-(lambda-lambda_D)^2 / (2 sigma_D^2))")
+    shape = _lineshape(cfg)
+    if shape == "voigt":
+        L.append(" MODEL   I(lambda) = B + m*lambda + A_H*V(lambda-lambda_H; sigma,gamma)")
+        L.append("                                  + A_D*V(lambda-lambda_D; sigma,gamma)")
+        L.append("         V = Voigt (Gaussian Doppler/instrument (x) Lorentzian")
+        L.append("         lifetime/pressure); sigma and gamma shared across H,D.")
+    else:
+        L.append(" MODEL   I(lambda) = B + m*lambda")
+        L.append("                   + A_H*exp(-(lambda-lambda_H)^2 / (2 sigma_H^2))")
+        L.append("                   + A_D*exp(-(lambda-lambda_D)^2 / (2 sigma_D^2))")
     lo, hi = cfg["fit_window"]
-    L.append(f"         fit window {lo}-{hi} nm;  H = longer-wavelength line.")
+    L.append(f"         line shape: {shape};  fit window {lo}-{hi} nm;  "
+             f"H = longer-wavelength line.")
     L.append("")
 
     # ---- helium offset ---------------------------------------------------- #
@@ -873,7 +1059,7 @@ def write_report(results: dict, cfg: dict = CONFIG,
         L.append(f"  NIST He I reference : {offset.nist_line:.5f} nm "
                  f"(+/- {cfg['helium_cal'].get('nist_line_err', 0.0):.0e})")
         L.append(f"  fit window          : {hlo}-{hhi} nm  "
-                 f"(single Gaussian + linear background)")
+                 f"(single {offset.lineshape} + linear background)")
         L.append("")
         L.append(f"  {'trial':28s} {'center (raw, nm)':>20s} {'chi2/dof':>9s} "
                  f"{'offset (nm)':>12s}")
@@ -882,6 +1068,9 @@ def write_report(results: dict, cfg: dict = CONFIG,
             L.append(f"  {n:28s} {c:10.4f} +/- {e:.4f} {x:9.1f} "
                      f"{offset.nist_line - c:+12.4f}")
         L.append("")
+        L.append(f"  He line widths      : Gaussian sigma {offset.sigma_he:.4f} nm"
+                 + (f",  Lorentzian gamma {offset.gamma_he:.4f} nm"
+                    if offset.lineshape == "voigt" else ""))
         L.append(f"  combined He center  : {offset.center_combined:.4f} +/- "
                  f"{offset.center_combined_err:.4f} nm  "
                  f"(trial scatter {offset.offset_scatter:.4f} nm)")
@@ -899,10 +1088,17 @@ def write_report(results: dict, cfg: dict = CONFIG,
     L.append(sub)
     for name, r in results.items():
         p = r.params
-        L.append(f" {name}")
+        L.append(f" {name}  [{r.lineshape}]")
         L.append(f"   background : B = {p['B']:.3f} counts,  m = {p['m']:.4f} counts/nm")
-        L.append(f"   H-alpha    : A = {p['A_H']:.1f} counts,  sigma = {p['sigma_H']:.4f} nm")
-        L.append(f"   D-alpha    : A = {p['A_D']:.1f} counts,  sigma = {p['sigma_D']:.4f} nm")
+        if r.lineshape == "voigt":
+            L.append(f"   H-alpha    : A = {p['A_H']:.1f} counts")
+            L.append(f"   D-alpha    : A = {p['A_D']:.1f} counts")
+            L.append(f"   widths     : Gaussian sigma = {r.sigma_gauss:.4f} nm "
+                     f"(FWHM {fwhm_gauss(r.sigma_gauss):.4f}), "
+                     f"Lorentzian gamma = {r.gamma_lor:.4f} nm  [shared H,D]")
+        else:
+            L.append(f"   H-alpha    : A = {p['A_H']:.1f} counts,  sigma = {p['sigma_H']:.4f} nm")
+            L.append(f"   D-alpha    : A = {p['A_D']:.1f} counts,  sigma = {p['sigma_D']:.4f} nm")
         L.append(f"   lambda_H   : {r.lambda_H:.4f} +/- {r.lambda_H_err:.4f} nm "
                  f"(fit {r.lambda_H_err_fit:.4f}, cal {r.lambda_H_err_cal:.4f})")
         L.append(f"   lambda_D   : {r.lambda_D:.4f} +/- {r.lambda_D_err:.4f} nm "
@@ -931,6 +1127,39 @@ def write_report(results: dict, cfg: dict = CONFIG,
     L.append(f"  literature : lambda_H {cfg.get('lambda_H_lit', float('nan')):.4f}, "
              f"lambda_D {cfg.get('lambda_D_lit', float('nan')):.4f}, "
              f"Delta lambda {cfg.get('dlambda_lit', float('nan')):.4f} nm")
+    L.append("")
+
+    # ---- line widths & Doppler temperature -------------------------------- #
+    if shape == "voigt":
+        pw = physical_widths(results, offset, cfg)
+        L.append(sub)
+        L.append(" LINE-SHAPE WIDTHS & DOPPLER TEMPERATURE  (shared Voigt, mean over trials)")
+        L.append(sub)
+        L.append(f"  Gaussian sigma (Doppler+instrument) : {pw['sigma_gauss']:.4f} nm "
+                 f"(FWHM {pw['fwhm_gauss']:.4f} nm)")
+        L.append(f"  Lorentzian gamma (lifetime+pressure): {pw['gamma_lor']:.4f} nm "
+                 f"(FWHM {pw['fwhm_lor']:.4f} nm)")
+        L.append(f"  Voigt FWHM                          : {pw['fwhm_voigt']:.4f} nm")
+        if np.isfinite(pw.get("sigma_inst", float("nan"))):
+            L.append(f"  instrumental sigma (from He line)   : {pw['sigma_inst']:.4f} nm")
+            if np.isfinite(pw.get("T_doppler", float("nan"))):
+                L.append(f"  Doppler sigma (H, deconvolved)      : "
+                         f"{pw['sigma_doppler']:.4f} nm  ->  T ~ {pw['T_doppler']:.0f} K "
+                         f"(ROUGH UPPER ESTIMATE -- see note)")
+            else:
+                L.append("  Doppler width: instrument >= observed Gaussian width here,")
+                L.append("                 so the thermal part is not resolvable.")
+        L.append("  notes:")
+        L.append("   - the natural (lifetime) Lorentzian for H-alpha is ~1e-4 nm, far")
+        L.append("     below resolution: the fitted gamma is pressure/instrument, not")
+        L.append("     the lifetime.")
+        L.append("   - the He line is asymmetric (red tail) and the symmetric Voigt")
+        L.append("     puts almost all its width into gamma, leaving its Gaussian sigma")
+        L.append("     ~0. So sigma_inst is poorly determined and the Doppler T is a")
+        L.append("     model-dependent UPPER estimate (the H Gaussian width also")
+        L.append("     contains unresolved Stark/instrument structure, not pure thermal).")
+        L.append("     A clean T needs a symmetric, well-resolved calibration line.")
+        L.append("")
     L.append(bar)
 
     text = "\n".join(L) + "\n"
@@ -989,5 +1218,12 @@ if __name__ == "__main__":
                       f"read {comb[k+'_read']:.1e})")
             print(f"  (plain mean Delta lambda = {comb['dlambda_mean']:.4f} "
                   f"+/- {comb['dlambda_sem']:.4f} nm SEM; scatter {comb['dlambda_std']:.4f})")
+            if _lineshape(CONFIG) == "voigt":
+                pw = physical_widths(results, offset, CONFIG)
+                print(f"  Voigt widths: Gaussian sigma {pw['sigma_gauss']:.4f} nm, "
+                      f"Lorentzian gamma {pw['gamma_lor']:.4f} nm")
+                if np.isfinite(pw.get("T_doppler", float("nan"))):
+                    print(f"  -> instrumental sigma {pw['sigma_inst']:.4f} nm (He), "
+                          f"Doppler T ~ {pw['T_doppler']:.0f} K")
         print(f"\nReport written to: {report}")
     print(f"Plots written to: {CONFIG['save_dir']}/")
