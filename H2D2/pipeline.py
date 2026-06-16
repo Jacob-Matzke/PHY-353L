@@ -63,7 +63,8 @@ CONFIG = {
     # calibration error -- only the absolute lambda_H / lambda_D depend on it.
     "calibration": {
         "enabled": False,
-        "offset": 0.0,     # nm
+        "offset": 0.0,     # nm  (set by the helium offset step; ADDED to lambda)
+        "offset_err": 0.0, # nm  1-sigma of the measured offset (common-mode)
         "scale": 1.0,      # dimensionless
         # OceanView pixel -> wavelength calibration of the HR4000 (used for the
         # wavelength-calibration UNCERTAINTY, not to recompute the axis -- the
@@ -90,10 +91,27 @@ CONFIG = {
         "intensity": 5e-3,
     },
 
+    # --- helium wavelength-offset calibration ----------------------------- #
+    # A strong He I line at a known NIST wavelength is measured in each helium
+    # trial to determine the spectrometer's absolute horizontal (wavelength)
+    # shift. The mean offset is then ADDED to every spectrum (via the
+    # "calibration" block above), turning the H2D2 line centers into MEASURED
+    # absolute wavelengths instead of quoted ones -- needed for particle-mass
+    # calculations. A constant offset cancels in Delta lambda, so this does not
+    # change the separation; it fixes the absolute scale and its uncertainty.
+    "helium_cal": {
+        "enabled": True,
+        "data_root": "Helium Calibration Data",
+        "nist_line": 667.81517,         # NIST He I reference wavelength (nm)
+        "nist_line_err": 1e-4,          # reference uncertainty (nm); 0 to ignore
+        "fit_window": (667.00, 667.55),  # window around the He line to fit
+        "sigma_guess": 0.02,            # nm; the He line is near instrument-limited
+    },
+
     # --- 3. crop ---------------------------------------------------------- #
     # Fit window (nm) around the doublet. Wide enough to pin the background on
     # both sides, tight enough to exclude unrelated lines / cosmic-ray spikes.
-    "fit_window": (654.5, 656.4),
+    "fit_window": (655.0, 657.0),
 
     # --- 4. fit ----------------------------------------------------------- #
     "fit": {
@@ -182,6 +200,40 @@ class FitResult:
         return "\n".join(lines)
 
 
+@dataclass
+class OffsetResult:
+    """Result of the helium wavelength-offset calibration."""
+    nist_line: float                  # reference He I wavelength (nm)
+    trial_names: list                 # per-trial file names
+    centers: np.ndarray               # fitted He centers, raw scale (nm)
+    centers_err: np.ndarray           # per-trial fit 1-sigma (nm)
+    chi2_dof: np.ndarray              # per-trial reduced chi^2
+    center_combined: float            # inverse-variance mean He center (nm)
+    center_combined_err: float        # pooled (Birge-inflated) 1-sigma (nm)
+    offset: float                     # nist_line - center_combined  (nm, ADD to lambda)
+    offset_err: float                 # total 1-sigma of the offset (nm)
+    offset_scatter: float             # std of per-trial offsets (nm)
+    fits: list = field(default_factory=list)   # (wl, it, popt) per trial, for plots
+
+    def summary(self) -> str:
+        lines = [
+            "Helium wavelength-offset calibration",
+            f"  NIST He I line   : {self.nist_line:.5f} nm",
+            f"  trials           : {len(self.centers)}",
+        ]
+        for n, c, e, x in zip(self.trial_names, self.centers,
+                              self.centers_err, self.chi2_dof):
+            lines.append(f"    {n:28s} center {c:.4f} +/- {e:.4f} nm  "
+                         f"(chi2/dof {x:.1f})  offset {self.nist_line - c:+.4f} nm")
+        lines += [
+            f"  combined center  : {self.center_combined:.4f} +/- "
+            f"{self.center_combined_err:.4f} nm",
+            f"  trial scatter    : {self.offset_scatter:.4f} nm",
+            f"  OFFSET (added)   : {self.offset:+.4f} +/- {self.offset_err:.4f} nm",
+        ]
+        return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- #
 # 1. Loading                                                                  #
 # --------------------------------------------------------------------------- #
@@ -198,13 +250,16 @@ def _data_start(path: str, marker: str) -> int:
     return 0
 
 
-def load_spectrum(run: str, cfg: dict = CONFIG) -> pd.DataFrame:
+def load_spectrum(run: str, cfg: dict = CONFIG, calibrate: bool = True,
+                  data_root: Optional[str] = None) -> pd.DataFrame:
     """Load one spectrum file into a DataFrame with columns wavelength, intensity.
 
     `run` may be a full path to a .txt file, or a bare name resolved under
-    cfg["data_root"] (with or without the .txt suffix).
+    `data_root` (default cfg["data_root"]), with or without the .txt suffix.
+    Set calibrate=False to get the RAW recorded wavelengths (used when measuring
+    the helium offset, so the offset is not applied on top of itself).
     """
-    path = _resolve_path(run, cfg)
+    path = _resolve_path(run, cfg, data_root)
     skip = _data_start(path, cfg["header_marker"])
     raw = pd.read_csv(path, skiprows=skip, header=None, sep=r"\s+",
                       engine="python", names=["wavelength", "intensity"])
@@ -212,25 +267,25 @@ def load_spectrum(run: str, cfg: dict = CONFIG) -> pd.DataFrame:
     it = pd.to_numeric(raw["intensity"], errors="coerce")
     df = pd.DataFrame({"wavelength": wl, "intensity": it}).dropna()
     df = df.sort_values("wavelength").reset_index(drop=True)
-    return apply_calibration(df, cfg)
+    return apply_calibration(df, cfg) if calibrate else df
 
 
-def _resolve_path(run: str, cfg: dict) -> str:
+def _resolve_path(run: str, cfg: dict, data_root: Optional[str] = None) -> str:
     """Find the spectrum file for `run` (path, name, or name w/o .txt)."""
     if os.path.isfile(run):
         return run
+    root = data_root or cfg["data_root"]
     for cand in (run, run + ".txt",
-                 os.path.join(cfg["data_root"], run),
-                 os.path.join(cfg["data_root"], run + ".txt")):
+                 os.path.join(root, run),
+                 os.path.join(root, run + ".txt")):
         if os.path.isfile(cand):
             return cand
-    raise FileNotFoundError(f"no spectrum file for run={run!r} (looked in "
-                            f"{cfg['data_root']!r})")
+    raise FileNotFoundError(f"no spectrum file for run={run!r} (looked in {root!r})")
 
 
-def list_runs(cfg: dict = CONFIG) -> list[str]:
-    """All .txt spectra under the data root, sorted (acquisition order)."""
-    return sorted(glob.glob(os.path.join(cfg["data_root"], "*.txt")))
+def list_runs(cfg: dict = CONFIG, data_root: Optional[str] = None) -> list[str]:
+    """All .txt spectra under a data root, sorted (acquisition order)."""
+    return sorted(glob.glob(os.path.join(data_root or cfg["data_root"], "*.txt")))
 
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +328,86 @@ def calibration_rel_error(wl_full: np.ndarray, cfg: dict = CONFIG) -> float:
     return float(np.sqrt(max(0.0, 1.0 - r2)) * np.std(wl) / mean)
 
 
+def fit_helium_line(df: pd.DataFrame, cfg: dict = CONFIG):
+    """Fit a single Gaussian + linear background to the He I calibration line.
+
+    Returns (center, center_err, chi2_dof, popt, wl, it) on the wavelength scale
+    of the supplied df (use a RAW-loaded df so the offset is measured against the
+    uncorrected axis). The center is the line position used for the offset.
+    """
+    hc = cfg["helium_cal"]
+    lo, hi = hc["fit_window"]
+    m = (df["wavelength"] >= lo) & (df["wavelength"] <= hi)
+    wl = df.loc[m, "wavelength"].to_numpy(dtype=float)
+    it = df.loc[m, "intensity"].to_numpy(dtype=float)
+    if len(wl) < 6:
+        raise ValueError(f"only {len(wl)} points in helium fit window "
+                         f"{hc['fit_window']}; adjust CONFIG['helium_cal']['fit_window'].")
+
+    edge = max(3, len(it) // 10)
+    B0 = float(np.median(np.concatenate([it[:edge], it[-edge:]])))
+    lam0 = float(wl[np.argmax(it)])
+    A0 = max(float(it.max() - B0), 1.0)
+    sig0 = float(hc.get("sigma_guess", 0.02))
+    p0 = [B0, 0.0, A0, lam0, sig0]
+    bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3],
+              [np.inf, np.inf, np.inf, hi, 0.3])
+    popt, pcov = curve_fit(one_gaussian, wl, it, p0=p0, bounds=bounds,
+                           absolute_sigma=False, maxfev=cfg["fit"]["maxfev"])
+    perr = np.sqrt(np.diag(pcov))
+    center, center_err = float(popt[3]), float(perr[3])
+
+    resid = it - one_gaussian(wl, *popt)
+    dof = max(1, len(wl) - len(popt))
+    noise = float(np.std(np.concatenate([resid[:edge], resid[-edge:]]))) or 1.0
+    chi2_dof = float(np.sum((resid / noise) ** 2) / dof)
+    return center, center_err, chi2_dof, popt, wl, it
+
+
+def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResult:
+    """Measure the spectrometer's wavelength offset from the helium trials.
+
+    Each helium spectrum is loaded RAW (uncalibrated), the He I line is fit, and
+    the per-trial offset is nist_line - center. The trial centers are pooled by
+    inverse-variance weighting (Birge-inflated for run-to-run scatter); the
+    reported offset is nist_line - pooled_center and is ADDED to every spectrum.
+
+    If apply=True the offset (and its 1-sigma) is written into
+    cfg["calibration"], turning on the additive correction for all later loads.
+    """
+    hc = cfg["helium_cal"]
+    files = list_runs(cfg, data_root=hc["data_root"])
+    if not files:
+        raise FileNotFoundError(f"no helium spectra in {hc['data_root']!r}")
+
+    names, centers, cerr, chi, fits = [], [], [], [], []
+    for f in files:
+        df = load_spectrum(f, cfg, calibrate=False)     # raw recorded wavelengths
+        c, e, x, popt, wl, it = fit_helium_line(df, cfg)
+        names.append(_run_name(f)); centers.append(c); cerr.append(e); chi.append(x)
+        fits.append((wl, it, popt))
+    centers = np.array(centers); cerr = np.array(cerr); chi = np.array(chi)
+
+    comb = _weighted_combine(centers, cerr)             # pooled He center
+    center_comb, center_comb_err = comb["value"], comb["error"]
+    nist = float(hc["nist_line"]); nist_err = float(hc.get("nist_line_err", 0.0))
+    offset = nist - center_comb
+    offset_err = float(np.hypot(center_comb_err, nist_err))
+
+    res = OffsetResult(
+        nist_line=nist, trial_names=names, centers=centers, centers_err=cerr,
+        chi2_dof=chi, center_combined=center_comb, center_combined_err=center_comb_err,
+        offset=offset, offset_err=offset_err, offset_scatter=comb["std"], fits=fits,
+    )
+    if apply:
+        cal = cfg["calibration"]
+        cal["enabled"] = True
+        cal["offset"] = offset
+        cal["offset_err"] = offset_err
+        cal["scale"] = cal.get("scale", 1.0) or 1.0
+    return res
+
+
 # --------------------------------------------------------------------------- #
 # 3. Crop                                                                      #
 # --------------------------------------------------------------------------- #
@@ -293,6 +428,11 @@ def two_gaussian(lmbda, B, m, A_H, lam_H, sig_H, A_D, lam_D, sig_D):
     gH = A_H * np.exp(-((lmbda - lam_H) ** 2) / (2.0 * sig_H ** 2))
     gD = A_D * np.exp(-((lmbda - lam_D) ** 2) / (2.0 * sig_D ** 2))
     return bg + gH + gD
+
+
+def one_gaussian(lmbda, B, m, A, lam0, sig):
+    """Sloped background plus a single Gaussian peak (the helium-line model)."""
+    return B + m * lmbda + A * np.exp(-((lmbda - lam0) ** 2) / (2.0 * sig ** 2))
 
 
 def initial_guess(wl: np.ndarray, it: np.ndarray, cfg: dict = CONFIG):
@@ -411,10 +551,14 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     A_D, sig_D = popt[i_lo - 1], popt[i_lo + 1]
     popt_ordered = np.array([B, m, A_H, lambda_H, sig_H, A_D, lambda_D, sig_D])
 
-    # calibration systematic (fractional scale error, common across trials)
+    # calibration systematic (common-mode across trials). Two pieces hit the
+    # ABSOLUTE centers: the fractional dispersion/scale error (from R^2) and the
+    # measured helium-offset uncertainty. Only the scale survives in Delta lambda
+    # -- the additive offset (and its error) cancel in lambda_H - lambda_D.
     rel_cal = calibration_rel_error(df["wavelength"].to_numpy(dtype=float), cfg)
-    lamH_cal = rel_cal * lambda_H
-    lamD_cal = rel_cal * lambda_D
+    off_err = float(cfg.get("calibration", {}).get("offset_err", 0.0))
+    lamH_cal = float(np.hypot(rel_cal * lambda_H, off_err))
+    lamD_cal = float(np.hypot(rel_cal * lambda_D, off_err))
     dl_cal = rel_cal * abs(dlambda)        # offset cancels; only the scale survives
 
     # readout floors on a center: wavelength quantization (sigma_wl) and the
@@ -548,6 +692,38 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
     return out
 
 
+def plot_helium(offset: OffsetResult, cfg: dict = CONFIG,
+                save_path: Optional[str] = None) -> str:
+    """Overlay the helium-line fits (raw scale) with the NIST line and the
+    fitted centers, annotated with the measured offset."""
+    out = save_path or os.path.join(cfg["save_dir"], "helium_offset.png")
+    _ensure_dir(os.path.dirname(out) or ".")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    cmap = plt.get_cmap("tab10")
+    for k, ((wl, it, popt), name, c) in enumerate(
+            zip(offset.fits, offset.trial_names, offset.centers)):
+        color = cmap(k % 10)
+        ax.scatter(wl, it, s=8, alpha=0.4, color=color)
+        grid = np.linspace(wl.min(), wl.max(), 800)
+        ax.plot(grid, one_gaussian(grid, *popt), lw=1.4, color=color,
+                label=f"{name}: center {c:.4f} nm")
+        ax.axvline(c, color=color, ls="--", lw=0.8, alpha=0.6)
+    ax.axvline(offset.nist_line, color="k", lw=1.6, ls="-",
+               label=f"NIST He I {offset.nist_line:.5f} nm")
+    ax.set_xlabel("Wavelength (nm, raw / uncorrected)")
+    ax.set_ylabel("Intensity (counts)")
+    ax.set_title("Helium offset calibration "
+                 f"(offset = {offset.offset:+.4f} $\\pm$ {offset.offset_err:.4f} nm)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    if cfg.get("show"):
+        plt.show()
+    plt.close(fig)
+    return out
+
+
 def plot_combined(results: dict, cfg: dict = CONFIG, tag: str = "combined") -> str:
     """Delta lambda per run with error bars + the weighted-mean band."""
     _ensure_dir(cfg["save_dir"])
@@ -609,8 +785,9 @@ def combine_runs(results: dict, cfg: dict = CONFIG) -> dict:
 
     rel_cal = float(np.mean([r.rel_cal for r in good.values()]))
     sig_wl = float(cfg.get("readout", {}).get("wavelength_nm", 0.0))
+    off_err = float(cfg.get("calibration", {}).get("offset_err", 0.0))
 
-    out = {"n_runs": len(good), "rel_cal": rel_cal}
+    out = {"n_runs": len(good), "rel_cal": rel_cal, "offset_err": off_err}
     for key, fitkey, n_read in (("lambda_H", "lambda_H_err_fit", 1.0),
                                 ("lambda_D", "lambda_D_err_fit", 1.0),
                                 ("dlambda", "dlambda_err_fit", np.sqrt(2.0))):
@@ -619,7 +796,11 @@ def combine_runs(results: dict, cfg: dict = CONFIG) -> dict:
         c = _weighted_combine(vals, errs)             # pools the statistical term
         value = c["value"]
         stat = c["error"]
-        cal = rel_cal * abs(value)                    # common-mode, added once
+        # calibration systematic (common-mode, added once): scale error always,
+        # plus the helium-offset error on ABSOLUTE centers (cancels in dlambda).
+        cal = rel_cal * abs(value)
+        if key != "dlambda":
+            cal = float(np.hypot(cal, off_err))
         read = n_read * sig_wl                        # common-mode, added once
         total = float(np.sqrt(stat ** 2 + cal ** 2 + read ** 2))
         out[key] = value
@@ -656,6 +837,109 @@ def _weighted_combine(vals: np.ndarray, errs: np.ndarray) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Text report                                                                 #
+# --------------------------------------------------------------------------- #
+
+def write_report(results: dict, cfg: dict = CONFIG,
+                 offset: Optional[OffsetResult] = None,
+                 save_path: Optional[str] = None) -> str:
+    """Write a human-readable .txt summary: the helium offset calibration, every
+    per-trial fit (parameters, peaks, uncertainty breakdown), and the final
+    combined result with its full uncertainty budget."""
+    from datetime import datetime
+    out = save_path or os.path.join(cfg["save_dir"], "H2D2_summary.txt")
+    _ensure_dir(os.path.dirname(out) or ".")
+    L = []
+    bar = "=" * 78
+    sub = "-" * 78
+    L.append(bar)
+    L.append(" H2D2  -  Hydrogen / Deuterium Balmer-alpha analysis summary")
+    L.append(f" generated {datetime.now():%Y-%m-%d %H:%M:%S}")
+    L.append(bar)
+    L.append("")
+    L.append(" MODEL   I(lambda) = B + m*lambda")
+    L.append("                   + A_H*exp(-(lambda-lambda_H)^2 / (2 sigma_H^2))")
+    L.append("                   + A_D*exp(-(lambda-lambda_D)^2 / (2 sigma_D^2))")
+    lo, hi = cfg["fit_window"]
+    L.append(f"         fit window {lo}-{hi} nm;  H = longer-wavelength line.")
+    L.append("")
+
+    # ---- helium offset ---------------------------------------------------- #
+    L.append(sub)
+    L.append(" HELIUM WAVELENGTH-OFFSET CALIBRATION")
+    L.append(sub)
+    if offset is not None:
+        hlo, hhi = cfg["helium_cal"]["fit_window"]
+        L.append(f"  NIST He I reference : {offset.nist_line:.5f} nm "
+                 f"(+/- {cfg['helium_cal'].get('nist_line_err', 0.0):.0e})")
+        L.append(f"  fit window          : {hlo}-{hhi} nm  "
+                 f"(single Gaussian + linear background)")
+        L.append("")
+        L.append(f"  {'trial':28s} {'center (raw, nm)':>20s} {'chi2/dof':>9s} "
+                 f"{'offset (nm)':>12s}")
+        for n, c, e, x in zip(offset.trial_names, offset.centers,
+                              offset.centers_err, offset.chi2_dof):
+            L.append(f"  {n:28s} {c:10.4f} +/- {e:.4f} {x:9.1f} "
+                     f"{offset.nist_line - c:+12.4f}")
+        L.append("")
+        L.append(f"  combined He center  : {offset.center_combined:.4f} +/- "
+                 f"{offset.center_combined_err:.4f} nm  "
+                 f"(trial scatter {offset.offset_scatter:.4f} nm)")
+        L.append(f"  APPLIED OFFSET      : {offset.offset:+.4f} +/- "
+                 f"{offset.offset_err:.4f} nm   (added to every wavelength)")
+        L.append("  note: a constant offset cancels in Delta lambda; it fixes the")
+        L.append("        ABSOLUTE centers and contributes the offset_err to them.")
+    else:
+        L.append("  (helium offset not applied)")
+    L.append("")
+
+    # ---- per-trial fits --------------------------------------------------- #
+    L.append(sub)
+    L.append(" PER-TRIAL H2D2 FITS   (wavelengths are offset-corrected / measured)")
+    L.append(sub)
+    for name, r in results.items():
+        p = r.params
+        L.append(f" {name}")
+        L.append(f"   background : B = {p['B']:.3f} counts,  m = {p['m']:.4f} counts/nm")
+        L.append(f"   H-alpha    : A = {p['A_H']:.1f} counts,  sigma = {p['sigma_H']:.4f} nm")
+        L.append(f"   D-alpha    : A = {p['A_D']:.1f} counts,  sigma = {p['sigma_D']:.4f} nm")
+        L.append(f"   lambda_H   : {r.lambda_H:.4f} +/- {r.lambda_H_err:.4f} nm "
+                 f"(fit {r.lambda_H_err_fit:.4f}, cal {r.lambda_H_err_cal:.4f})")
+        L.append(f"   lambda_D   : {r.lambda_D:.4f} +/- {r.lambda_D_err:.4f} nm "
+                 f"(fit {r.lambda_D_err_fit:.4f}, cal {r.lambda_D_err_cal:.4f})")
+        L.append(f"   Delta lam  : {r.dlambda:.4f} +/- {r.dlambda_err:.4f} nm "
+                 f"(fit {r.dlambda_err_fit:.4f}, cal {r.dlambda_err_cal:.1e})")
+        L.append(f"   chi2/dof   : {r.chi2_dof:.2f}   (points {len(r.fit_wl)}, "
+                 f"converged {r.success})")
+        L.append("")
+
+    # ---- combined --------------------------------------------------------- #
+    comb = combine_runs(results, cfg)
+    L.append(sub)
+    L.append(f" COMBINED RESULT   ({comb['n_runs']} trials)")
+    L.append(sub)
+    L.append(f"  rel. calibration (scale) error : {comb['rel_cal']:.2e}")
+    L.append(f"  helium offset error            : {comb['offset_err']:.4f} nm")
+    for k, lab in (("lambda_H", "lambda_H    "), ("lambda_D", "lambda_D    "),
+                   ("dlambda", "Delta lambda")):
+        L.append(f"  {lab} = {comb[k]:.4f} +/- {comb[k+'_err']:.4f} nm "
+                 f"(stat {comb[k+'_stat']:.4f}, cal {comb[k+'_cal']:.1e}, "
+                 f"read {comb[k+'_read']:.1e})")
+    L.append(f"  plain mean Delta lambda = {comb['dlambda_mean']:.4f} +/- "
+             f"{comb['dlambda_sem']:.4f} nm (SEM);  scatter {comb['dlambda_std']:.4f} nm")
+    L.append("")
+    L.append(f"  literature : lambda_H {cfg.get('lambda_H_lit', float('nan')):.4f}, "
+             f"lambda_D {cfg.get('lambda_D_lit', float('nan')):.4f}, "
+             f"Delta lambda {cfg.get('dlambda_lit', float('nan')):.4f} nm")
+    L.append(bar)
+
+    text = "\n".join(L) + "\n"
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(text)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration                                                               #
 # --------------------------------------------------------------------------- #
 
@@ -673,6 +957,15 @@ def run_pipeline(run: str, cfg: dict = CONFIG, plots: bool = True) -> FitResult:
 
 if __name__ == "__main__":
     import sys
+
+    # 0. helium wavelength-offset calibration (applied to all later loads)
+    offset = None
+    if CONFIG.get("helium_cal", {}).get("enabled", False):
+        offset = compute_helium_offset(CONFIG, apply=True)
+        plot_helium(offset, CONFIG)
+        print(offset.summary())
+        print()
+
     runs = sys.argv[1:] or list_runs()
     results = {}
     for r in runs:
@@ -680,17 +973,21 @@ if __name__ == "__main__":
         results[res.run] = res
         print(res.summary())
         print()
-    if len(results) > 1:
-        comb = combine_runs(results)
-        plot_combined(results)
-        print("=" * 60)
-        print(f"Combined over {comb['n_runs']} runs "
-              f"(rel. calibration error {comb['rel_cal']:.2e}):")
-        for k, lab in (("lambda_H", "lambda_H    "), ("lambda_D", "lambda_D    "),
-                       ("dlambda", "Delta lambda")):
-            print(f"  {lab} = {comb[k]:.4f} +/- {comb[k+'_err']:.4f} nm "
-                  f"(stat {comb[k+'_stat']:.4f}, cal {comb[k+'_cal']:.1e}, "
-                  f"read {comb[k+'_read']:.1e})")
-        print(f"  (plain mean Delta lambda = {comb['dlambda_mean']:.4f} "
-              f"+/- {comb['dlambda_sem']:.4f} nm SEM; scatter {comb['dlambda_std']:.4f})")
-    print(f"\nPlots written to: {CONFIG['save_dir']}/")
+
+    if len(results) >= 1:
+        report = write_report(results, CONFIG, offset)
+        if len(results) > 1:
+            comb = combine_runs(results)
+            plot_combined(results)
+            print("=" * 60)
+            print(f"Combined over {comb['n_runs']} runs "
+                  f"(rel. cal {comb['rel_cal']:.2e}, offset err {comb['offset_err']:.4f} nm):")
+            for k, lab in (("lambda_H", "lambda_H    "), ("lambda_D", "lambda_D    "),
+                           ("dlambda", "Delta lambda")):
+                print(f"  {lab} = {comb[k]:.4f} +/- {comb[k+'_err']:.4f} nm "
+                      f"(stat {comb[k+'_stat']:.4f}, cal {comb[k+'_cal']:.1e}, "
+                      f"read {comb[k+'_read']:.1e})")
+            print(f"  (plain mean Delta lambda = {comb['dlambda_mean']:.4f} "
+                  f"+/- {comb['dlambda_sem']:.4f} nm SEM; scatter {comb['dlambda_std']:.4f})")
+        print(f"\nReport written to: {report}")
+    print(f"Plots written to: {CONFIG['save_dir']}/")
