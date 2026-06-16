@@ -32,7 +32,7 @@ from pipeline import CONFIG, load_spectrum, compute_helium_offset
 # --------------------------------------------------------------------------- #
 NEON_ROOT = "Neon Data"
 SAVE_DIR = "Neon Processed Outputs"
-N_LINES = 5            # number of strongest lines to examine for skew
+N_LINES = 8            # number of strongest lines to examine for skew
 HALF_WIN = 0.30        # nm half-window around each line for the skew overlay
 SHOW = False           # plt.show() in addition to saving
 
