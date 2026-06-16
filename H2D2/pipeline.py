@@ -150,6 +150,26 @@ CONFIG = {
     # The helium calibration line uses the SAME shape for consistency.
     "lineshape": "voigt",
 
+    # --- instrumental skew (red-tail) correction -------------------------- #
+    # Every bright line on this spectrometer shows the same one-sided RED tail
+    # (detector charge-transfer trailing / scattered light). We model it as the
+    # symmetric line convolved with a one-sided exponential of decay tau (nm,
+    # toward longer wavelength). The neon spectrum has many clean, isolated,
+    # near-instrument-limited lines, so tau is MEASURED there (measure_skew) and
+    # then FIXED when fitting the helium offset line and the H2D2 doublet -- so
+    # the fitted centers are the de-skewed (true) line positions.
+    #   enabled=False -> tau=0 -> the plain symmetric Voigt (toggle to compare).
+    "skew": {
+        "enabled": True,
+        "tau": None,                 # nm; filled in by measure_skew() (or set by hand)
+        "neon_root": "Neon Data",
+        "n_lines": 5,                # strongest neon lines used to measure tau
+        "half_window": 0.30,         # nm half-window around each neon line
+        "tau_guess": 0.02,           # nm
+        "tau_min": 1e-3,             # nm (lower bound for the free-tau neon fit)
+        "tau_max": 0.20,             # nm
+    },
+
     # --- expected physics (annotation only) ------------------------------- #
     # literature H-alpha / D-alpha and their separation (nm), shown on plots.
     "lambda_H_lit": 656.279,
@@ -186,6 +206,8 @@ class FitResult:
     # canonical unpacked parameters (always B,m,A_H,lambda_H,sigma_H,gamma_H,...):
     pdict: dict = field(default_factory=dict)
     lineshape: str = "gaussian"
+    skew_tau: float = 0.0              # applied instrumental red-tail decay (nm; 0=off)
+    rms_resid: float = float("nan")    # RMS fit residual (counts; comparable across toggle)
     sigma_gauss: float = float("nan")  # shared/representative Gaussian width (nm)
     gamma_lor: float = 0.0             # shared Lorentzian HWHM (nm; 0 for gaussian)
     # --- uncertainty breakdown (so the budget is transparent) ------------- #
@@ -208,11 +230,12 @@ class FitResult:
     def model(self, x):
         """Evaluate the fitted curve (background + both peaks) at x."""
         p = self.pdict
+        tau = p.get("tau", self.skew_tau)
         return (p["B"] + p["m"] * x
                 + peak_profile(self.lineshape, x, p["A_H"], p["lambda_H"],
-                               p["sigma_H"], p["gamma_H"])
+                               p["sigma_H"], p["gamma_H"], tau)
                 + peak_profile(self.lineshape, x, p["A_D"], p["lambda_D"],
-                               p["sigma_D"], p["gamma_D"]))
+                               p["sigma_D"], p["gamma_D"], tau))
 
     def summary(self) -> str:
         if self.lineshape == "voigt":
@@ -228,7 +251,8 @@ class FitResult:
             f"Run: {self.run}  [{self.lineshape}]",
             f"  fit window       : {self.fit_wl.min():.3f} - {self.fit_wl.max():.3f} nm "
             f"({len(self.fit_wl)} pts)",
-            f"  converged        : {self.success}   chi2/dof = {self.chi2_dof:.2f}",
+            f"  converged        : {self.success}   chi2/dof = {self.chi2_dof:.2f}"
+            f"   RMS resid = {self.rms_resid:.1f} cts",
             f"  lambda_H (H-alpha): {self.lambda_H:.4f} +/- {self.lambda_H_err:.4f} nm "
             f"(fit {self.lambda_H_err_fit:.4f}, cal {self.lambda_H_err_cal:.4f})",
             f"  lambda_D (D-alpha): {self.lambda_D:.4f} +/- {self.lambda_D_err:.4f} nm "
@@ -256,6 +280,7 @@ class OffsetResult:
     lineshape: str = "gaussian"       # shape used for the He center fit
     sigma_he: float = float("nan")    # mean He Gaussian width sigma (nm)
     gamma_he: float = 0.0             # mean He Lorentzian HWHM gamma (nm)
+    skew_tau: float = 0.0             # applied instrumental skew tau (nm; 0=off)
     fits: list = field(default_factory=list)   # (wl, it, popt) per trial, for plots
 
     def summary(self) -> str:
@@ -274,6 +299,32 @@ class OffsetResult:
             f"  trial scatter    : {self.offset_scatter:.4f} nm",
             f"  OFFSET (added)   : {self.offset:+.4f} +/- {self.offset_err:.4f} nm",
         ]
+        return "\n".join(lines)
+
+
+@dataclass
+class SkewResult:
+    """Result of measuring the instrumental red-tail skew from the neon lines."""
+    lineshape: str
+    line_wl: np.ndarray               # fitted neon line centers (nm)
+    taus: np.ndarray                  # per-line exponential tail decay tau (nm)
+    sigmas: np.ndarray                # per-line Gaussian sigma (nm)
+    chi2_dof: np.ndarray
+    tau: float                        # adopted (median) skew tau (nm)
+    tau_scatter: float                # spread of per-line tau (nm)
+    n_trials: int = 0
+    fits: list = field(default_factory=list)   # (x, y, popt) per line, for plots
+
+    def summary(self) -> str:
+        lines = [
+            f"Instrumental skew (red-tail) measured from neon  [{self.lineshape}]",
+            f"  neon trials      : {self.n_trials}",
+            f"  lines used       : {len(self.taus)}",
+        ]
+        for w, t, x in zip(self.line_wl, self.taus, self.chi2_dof):
+            lines.append(f"    {w:9.3f} nm   tau {t:.4f} nm   (chi2/dof {x:.1f})")
+        lines.append(f"  ADOPTED tau      : {self.tau:.4f} +/- {self.tau_scatter:.4f} nm "
+                     f"(median over lines)")
         return "\n".join(lines)
 
 
@@ -372,11 +423,13 @@ def calibration_rel_error(wl_full: np.ndarray, cfg: dict = CONFIG) -> float:
 
 
 def fit_helium_line(df: pd.DataFrame, cfg: dict = CONFIG):
-    """Fit a single Gaussian + linear background to the He I calibration line.
+    """Fit a single line (+ linear background) to the He I calibration line, using
+    the configured shape and the APPLIED skew tau (_skew_tau).
 
-    Returns (center, center_err, chi2_dof, popt, wl, it) on the wavelength scale
-    of the supplied df (use a RAW-loaded df so the offset is measured against the
-    uncorrected axis). The center is the line position used for the offset.
+    Returns (center, center_err, chi2_dof, sigma, gamma, popt, wl, it) on the
+    wavelength scale of the supplied df (use a RAW-loaded df so the offset is
+    measured against the uncorrected axis). The center is the de-skewed line
+    position used for the offset.
     """
     hc = cfg["helium_cal"]
     lo, hi = hc["fit_window"]
@@ -394,13 +447,13 @@ def fit_helium_line(df: pd.DataFrame, cfg: dict = CONFIG):
     sig0 = float(hc.get("sigma_guess", 0.02))
     shape = _lineshape(cfg)
     f = cfg["fit"]
+    tau = skew_tau_at(cfg, float(hc["nist_line"]))   # red-tail decay local to He line
+    func = single_model(cfg, tau)
     if shape == "voigt":
-        func = one_voigt
         p0 = [B0, 0.0, A0, lam0, sig0, f.get("gamma_guess", 0.01)]
         bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3, 0.0],
                   [np.inf, np.inf, np.inf, hi, f["sigma_max"], f["gamma_max"]])
     else:
-        func = one_gaussian
         p0 = [B0, 0.0, A0, lam0, sig0]
         bounds = ([-np.inf, -np.inf, 0.0, lo, 1e-3],
                   [np.inf, np.inf, np.inf, hi, f["sigma_max"]])
@@ -416,6 +469,99 @@ def fit_helium_line(df: pd.DataFrame, cfg: dict = CONFIG):
     noise = float(np.std(np.concatenate([resid[:edge], resid[-edge:]]))) or 1.0
     chi2_dof = float(np.sum((resid / noise) ** 2) / dof)
     return center, center_err, chi2_dof, sigma, gamma, popt, wl, it
+
+
+def _average_spectrum(files: list, cfg: dict, calibrate: bool = False):
+    """Mean intensity over trial files sharing a wavelength grid."""
+    wl0, stack = None, []
+    for fp in files:
+        df = load_spectrum(fp, cfg, calibrate=calibrate)
+        if wl0 is None:
+            wl0 = df["wavelength"].to_numpy(dtype=float)
+        stack.append(df["intensity"].to_numpy(dtype=float))
+    return wl0, np.mean(np.vstack(stack), axis=0)
+
+
+def measure_skew(cfg: dict = CONFIG, apply: bool = True) -> SkewResult:
+    """Measure the instrumental red-tail decay tau from the neon lines.
+
+    Averages the neon trials, finds the strongest isolated lines, and fits each
+    with the configured symmetric shape convolved with a one-sided exponential
+    (tau FREE). The adopted skew is the median tau across the lines -- robust to
+    the odd blended line. If apply=True, tau is written into cfg["skew"]["tau"]
+    so the helium and H2D2 fits pick it up.
+    """
+    sc = cfg["skew"]
+    files = list_runs(cfg, data_root=sc["neon_root"])
+    if not files:
+        raise FileNotFoundError(f"no neon spectra in {sc['neon_root']!r}")
+    wl, it = _average_spectrum(files, cfg, calibrate=False)   # raw; tail is shift-free
+
+    rng = float(it.max() - it.min()) or 1.0
+    idx, props = find_peaks(it, prominence=0.05 * rng, distance=8)
+    order = np.argsort(props["prominences"])[::-1][:int(sc.get("n_lines", 5))]
+    lines = np.sort(idx[order])
+
+    ls = _lineshape(cfg)
+    f = cfg["fit"]
+    half = float(sc.get("half_window", 0.30))
+    # free-tau single-line model (adds tau as the last fit parameter)
+    if ls == "voigt":
+        def fline(l, B, m, A, lam0, sigma, gamma, tau):
+            return B + m * l + A * skewed_peak_values(l, lam0, sigma, gamma, tau, ls)
+    else:
+        def fline(l, B, m, A, lam0, sigma, tau):
+            return B + m * l + A * skewed_peak_values(l, lam0, sigma, 0.0, tau, ls)
+
+    wls, taus, sigs, chis, fits = [], [], [], [], []
+    for i in lines:
+        lo, hi = wl[i] - half, wl[i] + half
+        mm = (wl >= lo) & (wl <= hi)
+        x, y = wl[mm], it[mm]
+        if len(x) < 8:
+            continue
+        edge = max(3, len(y) // 10)
+        B0 = float(np.median(np.concatenate([y[:edge], y[-edge:]])))
+        A0 = max(float(y.max() - B0), 1.0)
+        lam0 = float(x[np.argmax(y)])
+        if ls == "voigt":
+            p0 = [B0, 0.0, A0, lam0, f["sigma_guess"], f.get("gamma_guess", 0.01),
+                  sc.get("tau_guess", 0.02)]
+            lb = [-np.inf, -np.inf, 0.0, lo, 1e-3, 0.0, sc["tau_min"]]
+            ub = [np.inf, np.inf, np.inf, hi, f["sigma_max"], f["gamma_max"], sc["tau_max"]]
+        else:
+            p0 = [B0, 0.0, A0, lam0, f["sigma_guess"], sc.get("tau_guess", 0.02)]
+            lb = [-np.inf, -np.inf, 0.0, lo, 1e-3, sc["tau_min"]]
+            ub = [np.inf, np.inf, np.inf, hi, f["sigma_max"], sc["tau_max"]]
+        try:
+            popt, _ = curve_fit(fline, x, y, p0=p0, bounds=(lb, ub),
+                                absolute_sigma=False, maxfev=f["maxfev"])
+        except Exception as exc:
+            print(f"  [warn] skew fit failed at {wl[i]:.2f} nm: {exc}")
+            continue
+        resid = y - fline(x, *popt)
+        edge = max(3, len(y) // 10)
+        noise = float(np.std(np.concatenate([resid[:edge], resid[-edge:]]))) or 1.0
+        chi = float(np.sum((resid / noise) ** 2) / max(1, len(x) - len(popt)))
+        wls.append(float(wl[i])); sigs.append(float(popt[4]))
+        taus.append(float(popt[-1])); chis.append(chi)
+        fits.append((x, y, popt))
+
+    taus = np.array(taus)
+    wls = np.array(wls)
+    tau_med = float(np.median(taus)) if len(taus) else 0.0
+    tau_scatter = float(np.std(taus, ddof=1)) if len(taus) > 1 else 0.0
+    res = SkewResult(lineshape=ls, line_wl=wls, taus=taus,
+                     sigmas=np.array(sigs), chi2_dof=np.array(chis),
+                     tau=tau_med, tau_scatter=tau_scatter,
+                     n_trials=len(files), fits=fits)
+    if apply:
+        cfg["skew"]["tau"] = tau_med
+        # tau(lambda) table (sorted) so the applied skew tracks the red growth
+        if len(taus):
+            order = np.argsort(wls)
+            cfg["skew"]["tau_table"] = (wls[order], taus[order])
+    return res
 
 
 def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResult:
@@ -454,7 +600,8 @@ def compute_helium_offset(cfg: dict = CONFIG, apply: bool = True) -> OffsetResul
         chi2_dof=chi, center_combined=center_comb, center_combined_err=center_comb_err,
         offset=offset, offset_err=offset_err, offset_scatter=comb["std"],
         lineshape=_lineshape(cfg), sigma_he=float(np.mean(sigmas)),
-        gamma_he=float(np.mean(gammas)), fits=fits,
+        gamma_he=float(np.mean(gammas)),
+        skew_tau=skew_tau_at(cfg, float(hc["nist_line"])), fits=fits,
     )
     if apply:
         cal = cfg["calibration"]
@@ -516,11 +663,101 @@ def _lineshape(cfg: dict) -> str:
     return str(cfg.get("lineshape", "gaussian")).lower()
 
 
-def peak_profile(lineshape, lmbda, A, lam0, sigma, gamma):
-    """Evaluate a single line's contribution (peak height A) for either shape."""
+def _symmetric_peak(dl, sigma, gamma, lineshape):
+    """Height-normalized SYMMETRIC line (value 1 at dl=0)."""
     if lineshape == "voigt":
-        return A * _voigt_peak(lmbda - lam0, sigma, gamma)
-    return A * np.exp(-((lmbda - lam0) ** 2) / (2.0 * sigma ** 2))
+        return _voigt_peak(dl, sigma, gamma)
+    return np.exp(-(dl ** 2) / (2.0 * sigma ** 2))
+
+
+def skewed_peak_values(lmbda, lam0, sigma, gamma, tau, lineshape):
+    """Height-normalized line at center lam0, optionally skewed by an instrumental
+    one-sided exponential of decay tau (nm) toward the RED (longer wavelength).
+
+    tau <= 0 returns the plain symmetric line. Otherwise the symmetric profile is
+    built on a fine uniform grid and convolved with a normalized causal kernel
+    exp(-t/tau) (t >= 0), then renormalized to unit peak height and interpolated
+    back to lmbda. Modeling the tail this way means the fitted lam0 is the TRUE
+    (pre-skew) center -- the asymmetry is absorbed by the kernel, not the center.
+    """
+    lmbda = np.asarray(lmbda, dtype=float)
+    if tau is None or tau <= 0:
+        return _symmetric_peak(lmbda - lam0, sigma, gamma, lineshape)
+    lo, hi = float(lmbda.min()), float(lmbda.max())
+    diffs = np.diff(np.sort(lmbda))
+    dx = float(np.median(diffs)) / 4.0 if len(diffs) else (hi - lo) / 400.0
+    dx = max(dx, 1e-5)
+    grid = np.arange(lo - 5 * dx, hi + 8.0 * tau + dx, dx)
+    sym = _symmetric_peak(grid - lam0, sigma, gamma, lineshape)
+    n = int(np.ceil(8.0 * tau / dx))
+    t = np.arange(n + 1) * dx
+    kern = np.exp(-t / tau)
+    kern /= kern.sum()
+    conv = np.convolve(sym, kern)[:len(grid)]    # causal -> tail toward +lambda
+    peak = conv.max() or 1.0
+    return np.interp(lmbda, grid, conv / peak)
+
+
+def peak_profile(lineshape, lmbda, A, lam0, sigma, gamma, tau=0.0):
+    """Evaluate a single line's contribution (peak height A), with optional skew."""
+    return A * skewed_peak_values(lmbda, lam0, sigma, gamma, tau, lineshape)
+
+
+def _skew_tau(cfg: dict) -> float:
+    """Representative (median) skew tau to APPLY (nm), or 0 if skew is off.
+    Used for display; the fits use the wavelength-local value (skew_tau_at)."""
+    sc = cfg.get("skew", {})
+    if not sc.get("enabled", False):
+        return 0.0
+    tau = sc.get("tau")
+    return float(tau) if tau else 0.0
+
+
+def skew_tau_at(cfg: dict, lam: float) -> float:
+    """Wavelength-local skew tau (nm) to apply at wavelength `lam`.
+
+    The neon tail grows toward the red (a charge-transfer-inefficiency signature),
+    so we interpolate tau(lambda) from the per-line measurements (clamped at the
+    ends) rather than forcing a single constant. Falls back to the scalar tau (or
+    0) when no table / skew disabled."""
+    sc = cfg.get("skew", {})
+    if not sc.get("enabled", False):
+        return 0.0
+    tbl = sc.get("tau_table")
+    if tbl is not None and len(tbl[0]) >= 2:
+        lams, taus = tbl
+        return float(np.interp(lam, lams, taus))
+    tau = sc.get("tau")
+    return float(tau) if tau else 0.0
+
+
+def doublet_model(cfg: dict, tau: float):
+    """curve_fit model for the H/D doublet at fixed skew tau (same parameter
+    layout as the symmetric model, so toggling skew never changes the DOF)."""
+    ls = _lineshape(cfg)
+    if ls == "voigt":
+        def f(l, B, m, A_H, lam_H, A_D, lam_D, sigma, gamma):
+            return (B + m * l
+                    + A_H * skewed_peak_values(l, lam_H, sigma, gamma, tau, ls)
+                    + A_D * skewed_peak_values(l, lam_D, sigma, gamma, tau, ls))
+    else:
+        def f(l, B, m, A_H, lam_H, sig_H, A_D, lam_D, sig_D):
+            return (B + m * l
+                    + A_H * skewed_peak_values(l, lam_H, sig_H, 0.0, tau, ls)
+                    + A_D * skewed_peak_values(l, lam_D, sig_D, 0.0, tau, ls))
+    return f
+
+
+def single_model(cfg: dict, tau: float):
+    """curve_fit model for a single line (helium / neon) at fixed skew tau."""
+    ls = _lineshape(cfg)
+    if ls == "voigt":
+        def f(l, B, m, A, lam0, sigma, gamma):
+            return B + m * l + A * skewed_peak_values(l, lam0, sigma, gamma, tau, ls)
+    else:
+        def f(l, B, m, A, lam0, sigma):
+            return B + m * l + A * skewed_peak_values(l, lam0, sigma, 0.0, tau, ls)
+    return f
 
 
 def fwhm_gauss(sigma: float) -> float:
@@ -637,7 +874,9 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         common-mode across trials, and nearly cancels in Delta lambda.
     """
     shape = _lineshape(cfg)
-    model = two_voigt if shape == "voigt" else two_gaussian
+    lo_w, hi_w = cfg["fit_window"]
+    tau = skew_tau_at(cfg, 0.5 * (lo_w + hi_w))   # red-tail decay local to ~656 nm
+    model = doublet_model(cfg, tau)
     win = crop(df, cfg)
     wl = win["wavelength"].to_numpy(dtype=float)
     it = win["intensity"].to_numpy(dtype=float)
@@ -682,7 +921,8 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         gam_H = gam_D = 0.0
     pdict = {"B": B, "m": m,
              "A_H": A_H, "lambda_H": float(lambda_H), "sigma_H": sig_H, "gamma_H": gam_H,
-             "A_D": A_D, "lambda_D": float(lambda_D), "sigma_D": sig_D, "gamma_D": gam_D}
+             "A_D": A_D, "lambda_D": float(lambda_D), "sigma_D": sig_D, "gamma_D": gam_D,
+             "tau": float(tau)}
 
     # calibration systematic (common-mode across trials). Two pieces hit the
     # ABSOLUTE centers: the fractional dispersion/scale error (from R^2) and the
@@ -713,6 +953,10 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
     edge = max(3, len(it) // 10)
     noise = float(np.std(np.concatenate([resid[:edge], resid[-edge:]]))) or 1.0
     chi2_dof = float(np.sum((resid / noise) ** 2) / dof)
+    # RMS residual (counts): a fit-quality metric that is COMPARABLE across the
+    # skew toggle (unlike chi2/dof, whose baseline-noise denominator shifts when
+    # the wings start fitting better).
+    rms_resid = float(np.sqrt(np.mean(resid ** 2)))
 
     return FitResult(
         run=_run_name(run),
@@ -722,7 +966,7 @@ def fit_spectrum(df: pd.DataFrame, run: str, cfg: dict = CONFIG) -> FitResult:
         popt=np.asarray(popt, dtype=float), pcov=pcov,
         lambda_H=float(lambda_H), lambda_D=float(lambda_D), dlambda=float(dlambda),
         lambda_H_err=lambda_H_err, lambda_D_err=lambda_D_err, dlambda_err=dlambda_err,
-        pdict=pdict, lineshape=shape,
+        pdict=pdict, lineshape=shape, skew_tau=float(tau), rms_resid=rms_resid,
         sigma_gauss=0.5 * (sig_H + sig_D), gamma_lor=gam_H,
         lambda_H_err_fit=float(lamH_fit), lambda_D_err_fit=float(lamD_fit),
         dlambda_err_fit=dl_fit,
@@ -782,10 +1026,11 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
     ls = result.lineshape
     wl, it = result.fit_wl, result.fit_i
     grid = np.linspace(wl.min(), wl.max(), 1000)
+    tau = p.get("tau", result.skew_tau)
     model = result.model(grid)
     bg = p["B"] + p["m"] * grid
-    gH = bg + peak_profile(ls, grid, p["A_H"], p["lambda_H"], p["sigma_H"], p["gamma_H"])
-    gD = bg + peak_profile(ls, grid, p["A_D"], p["lambda_D"], p["sigma_D"], p["gamma_D"])
+    gH = bg + peak_profile(ls, grid, p["A_H"], p["lambda_H"], p["sigma_H"], p["gamma_H"], tau)
+    gD = bg + peak_profile(ls, grid, p["A_D"], p["lambda_D"], p["sigma_D"], p["gamma_D"], tau)
 
     fig, (ax, axr) = plt.subplots(
         2, 1, figsize=(9, 6.5), sharex=True,
@@ -810,10 +1055,14 @@ def plot_fit(result: FitResult, cfg: dict = CONFIG,
     if result.lineshape == "voigt":
         txt += (f"\n$\\sigma_G$={result.sigma_gauss:.4f}, "
                 f"$\\gamma_L$={result.gamma_lor:.4f} nm")
+    if result.skew_tau > 0:
+        txt += f"\nskew $\\tau$={result.skew_tau:.4f} nm"
     ax.text(0.02, 0.97, txt, transform=ax.transAxes, va="top", fontsize=9,
             bbox=dict(boxstyle="round", fc="white", ec="0.6", alpha=0.9))
     ax.set_ylabel("Intensity (counts)")
-    ax.set_title(f"{result.run}: H-alpha / D-alpha doublet fit ({result.lineshape})")
+    skewlab = f", skew on" if result.skew_tau > 0 else ", skew off"
+    ax.set_title(f"{result.run}: H-alpha / D-alpha doublet fit "
+                 f"({result.lineshape}{skewlab})")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right", fontsize=8)
 
@@ -837,7 +1086,7 @@ def plot_helium(offset: OffsetResult, cfg: dict = CONFIG,
     fitted centers, annotated with the measured offset."""
     out = save_path or os.path.join(cfg["save_dir"], "helium_offset.png")
     _ensure_dir(os.path.dirname(out) or ".")
-    he_model = one_voigt if offset.lineshape == "voigt" else one_gaussian
+    he_model = single_model(cfg, offset.skew_tau)   # matches the (skewed) fit
     fig, ax = plt.subplots(figsize=(9, 5))
     cmap = plt.get_cmap("tab10")
     for k, ((wl, it, popt), name, c) in enumerate(
@@ -854,6 +1103,44 @@ def plot_helium(offset: OffsetResult, cfg: dict = CONFIG,
     ax.set_ylabel("Intensity (counts)")
     ax.set_title("Helium offset calibration "
                  f"(offset = {offset.offset:+.4f} $\\pm$ {offset.offset_err:.4f} nm)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    if cfg.get("show"):
+        plt.show()
+    plt.close(fig)
+    return out
+
+
+def plot_skew(skew: SkewResult, cfg: dict = CONFIG,
+              save_path: Optional[str] = None) -> str:
+    """Show the neon skew fits: each strong line centered on its fitted peak,
+    peak-normalized, with the asymmetric (skewed) model overlaid."""
+    out = save_path or os.path.join(cfg["save_dir"], "neon_skew_fit.png")
+    _ensure_dir(os.path.dirname(out) or ".")
+    ls = skew.lineshape
+    fig, ax = plt.subplots(figsize=(9, 5))
+    cmap = plt.get_cmap("tab10")
+    for k, ((x, y, popt), w, t) in enumerate(zip(skew.fits, skew.line_wl, skew.taus)):
+        color = cmap(k % 10)
+        lam0 = popt[3]
+        ax.scatter(x - lam0, y / y.max(), s=8, alpha=0.4, color=color)
+        grid = np.linspace(x.min(), x.max(), 800)
+        # rebuild the model curve for this line (free-tau popt)
+        if ls == "voigt":
+            B, m, A, l0, sig, gam, tau = popt
+            curve = B + m * grid + A * skewed_peak_values(grid, l0, sig, gam, tau, ls)
+        else:
+            B, m, A, l0, sig, tau = popt
+            curve = B + m * grid + A * skewed_peak_values(grid, l0, sig, 0.0, tau, ls)
+        ax.plot(grid - lam0, (curve - curve.min()) / (curve.max() - curve.min()),
+                lw=1.4, color=color, label=f"{w:.2f} nm  ($\\tau$={t:.4f})")
+    ax.axvline(0, color="0.5", lw=0.8, ls="--")
+    ax.set_xlabel("Wavelength offset from peak (nm)   [+ = red / rightward]")
+    ax.set_ylabel("Normalized intensity")
+    ax.set_title(f"Neon skew fit  (adopted $\\tau$ = {skew.tau:.4f} "
+                 f"$\\pm$ {skew.tau_scatter:.4f} nm)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -1020,6 +1307,7 @@ def _weighted_combine(vals: np.ndarray, errs: np.ndarray) -> dict:
 
 def write_report(results: dict, cfg: dict = CONFIG,
                  offset: Optional[OffsetResult] = None,
+                 skew: Optional[SkewResult] = None,
                  save_path: Optional[str] = None) -> str:
     """Write a human-readable .txt summary: the helium offset calibration, every
     per-trial fit (parameters, peaks, uncertainty breakdown), and the final
@@ -1046,9 +1334,32 @@ def write_report(results: dict, cfg: dict = CONFIG,
         L.append("                   + A_H*exp(-(lambda-lambda_H)^2 / (2 sigma_H^2))")
         L.append("                   + A_D*exp(-(lambda-lambda_D)^2 / (2 sigma_D^2))")
     lo, hi = cfg["fit_window"]
+    skew_on = bool(cfg.get("skew", {}).get("enabled", False)) and bool(cfg["skew"].get("tau"))
     L.append(f"         line shape: {shape};  fit window {lo}-{hi} nm;  "
              f"H = longer-wavelength line.")
+    L.append(f"         skew correction: {'ON' if skew_on else 'OFF'}"
+             + (f"  (instrumental red-tail tau = {cfg['skew']['tau']:.4f} nm)"
+                if skew_on else ""))
     L.append("")
+
+    # ---- instrumental skew ------------------------------------------------ #
+    if skew is not None:
+        L.append(sub)
+        L.append(" INSTRUMENTAL SKEW (red-tail) FROM NEON")
+        L.append(sub)
+        L.append(f"  model: symmetric {skew.lineshape} (x) one-sided exponential "
+                 f"exp(-t/tau), t>=0 (red)")
+        L.append(f"  {'neon line (nm)':>15s} {'tau (nm)':>10s} {'chi2/dof':>10s}")
+        for w, t, x in zip(skew.line_wl, skew.taus, skew.chi2_dof):
+            L.append(f"  {w:15.3f} {t:10.4f} {x:10.1f}")
+        L.append(f"  median tau          : {skew.tau:.4f} +/- {skew.tau_scatter:.4f} nm "
+                 f"({skew.n_trials} trials, {len(skew.taus)} lines)")
+        L.append("  tau GROWS toward the red (charge-transfer-inefficiency signature),")
+        L.append("  so tau is interpolated in wavelength and applied LOCALLY:")
+        L.append(f"     tau(He 667.8 nm)  = {skew_tau_at(cfg, cfg['helium_cal']['nist_line']):.4f} nm")
+        L.append(f"     tau(H2D2 ~656 nm) = {skew_tau_at(cfg, 0.5*sum(cfg['fit_window'])):.4f} nm")
+        L.append("  -> fixed when fitting the helium and H2D2 lines (de-skews centers).")
+        L.append("")
 
     # ---- helium offset ---------------------------------------------------- #
     L.append(sub)
@@ -1105,8 +1416,8 @@ def write_report(results: dict, cfg: dict = CONFIG,
                  f"(fit {r.lambda_D_err_fit:.4f}, cal {r.lambda_D_err_cal:.4f})")
         L.append(f"   Delta lam  : {r.dlambda:.4f} +/- {r.dlambda_err:.4f} nm "
                  f"(fit {r.dlambda_err_fit:.4f}, cal {r.dlambda_err_cal:.1e})")
-        L.append(f"   chi2/dof   : {r.chi2_dof:.2f}   (points {len(r.fit_wl)}, "
-                 f"converged {r.success})")
+        L.append(f"   chi2/dof   : {r.chi2_dof:.2f}   RMS resid {r.rms_resid:.1f} cts   "
+                 f"(points {len(r.fit_wl)}, converged {r.success})")
         L.append("")
 
     # ---- combined --------------------------------------------------------- #
@@ -1187,7 +1498,15 @@ def run_pipeline(run: str, cfg: dict = CONFIG, plots: bool = True) -> FitResult:
 if __name__ == "__main__":
     import sys
 
-    # 0. helium wavelength-offset calibration (applied to all later loads)
+    # 0a. instrumental skew (red-tail tau) measured from neon, applied to all fits
+    skew = None
+    if CONFIG.get("skew", {}).get("enabled", False):
+        skew = measure_skew(CONFIG, apply=True)
+        plot_skew(skew, CONFIG)
+        print(skew.summary())
+        print()
+
+    # 0b. helium wavelength-offset calibration (applied to all later loads)
     offset = None
     if CONFIG.get("helium_cal", {}).get("enabled", False):
         offset = compute_helium_offset(CONFIG, apply=True)
@@ -1204,7 +1523,7 @@ if __name__ == "__main__":
         print()
 
     if len(results) >= 1:
-        report = write_report(results, CONFIG, offset)
+        report = write_report(results, CONFIG, offset, skew)
         if len(results) > 1:
             comb = combine_runs(results)
             plot_combined(results)
