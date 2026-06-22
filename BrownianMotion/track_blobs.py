@@ -102,10 +102,25 @@ def analyse(frames, cfg):
     """
     print(f"Detecting beads with trackpy "
           f"(diameter={cfg.diameter}, minmass={cfg.minmass}, invert=True)...")
-    features = tp.batch(frames, cfg.diameter, invert=True,
-                        minmass=cfg.minmass, processes=cfg.processes)
+    n = len(frames)
+    if cfg.processes == 1:
+        # Locate frame-by-frame so we can show progress (~0.5 s/frame).
+        import pandas as pd
+        parts = []
+        for i in range(n):
+            f = tp.locate(frames[i], cfg.diameter, invert=True,
+                          minmass=cfg.minmass)
+            f["frame"] = i
+            parts.append(f)
+            print(f"\r  detecting frame {i + 1}/{n} "
+                  f"({100 * (i + 1) // n}%)", end="", flush=True)
+        print()
+        features = pd.concat(parts).reset_index(drop=True)
+    else:
+        features = tp.batch(frames, cfg.diameter, invert=True,
+                            minmass=cfg.minmass, processes=cfg.processes)
     print(f"  found {len(features)} raw features "
-          f"({len(features) / len(frames):.1f}/frame)")
+          f"({len(features) / n:.1f}/frame)")
 
     print(f"Linking (search_range={cfg.search_range}, memory={cfg.memory})...")
     # No motion predictor: the motion is Brownian (random), so velocity
