@@ -1,1 +1,1 @@
-python track_blobs.py input/cal.tif --fps 30 --mpp 50/360 --bead-diameter 1.0 --bead-diameter-err 0.05 --water-temp 25.6 --water-temp-err 0.05 --mpp-err 0.002 --subtract-drift
+python track_blobs.py input/D2T7_Capped.tif --fps 30 --mpp 50/360 --bead-diameter 1.0 --bead-diameter-err 0.05 --water-temp 25.6 --water-temp-err 0.05 --mpp-err 0.002

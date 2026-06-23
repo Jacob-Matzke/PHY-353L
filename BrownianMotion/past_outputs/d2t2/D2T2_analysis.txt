@@ -1,0 +1,31 @@
+Brownian motion analysis  -  D2T2.tif
+========================================================
+
+ensemble D        = 64.9583 um^2/s
+per-particle D    = 66.2074 +/- 14.4 um^2/s (SEM, n=9)
+MSD linear-fit R2 = 0.98127 (first 20 lags)
+anomalous alpha   = 1.3622
+
+inputs (value +/- 1 sigma):
+  acquisition fps   = 30.0
+  microns/pixel     = 0.1388888888888889 +/- 0.002
+  bead diameter     = 1.0 +/- 0.05 um
+  water temperature = 25.6 +/- 0.05 degC
+
+T                 = 298.750 K
+water viscosity   = 8.783794e-04 Pa*s
+bead radius       = 5.000000e-07 m
+Stokes drag gamma = 8.278531e-09 kg/s
+
+kB  (measured)    = 1.800030e-21 +/- 4.059e-22 J/K
+kB  (literature)  = 1.380649e-23 J/K   (+12937.57 %)
+N_A (measured)    = 4.619068e+21 +/- 1.042e+21 /mol
+N_A (literature)  = 6.022141e+23 /mol   (-99.23 %)
+D   (theory)      = 0.498239 um^2/s   (measured +12937.57 %)
+
+error budget (relative, added in quadrature):
+  D_stat        =  21.80 %   (  93 % of total variance)
+  bead_radius   =   5.00 %   (   5 % of total variance)
+  D_calibration =   2.88 %   (   2 % of total variance)
+  temperature   =   0.13 %   (   0 % of total variance)
+  TOTAL kB/N_A  =  22.55 %
