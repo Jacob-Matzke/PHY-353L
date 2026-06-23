@@ -525,7 +525,8 @@ def compute_msd(traj, cfg):
     nan = float("nan")
     if len(em) < 2:
         return {"em": em, "D": nan, "slope": nan, "intercept": nan,
-                "n_fit": 0, "r2": nan, "alpha": nan, "loglog_A": nan}
+                "n_fit": 0, "r2": nan, "alpha": nan, "alpha_raw": nan,
+                "loglog_A": nan}
     lags, msd = em.index.values, em.values
 
     # Linear fit over the first msd_fit_frac of the curve.  MSD(t) = 4*D*t +
@@ -542,18 +543,32 @@ def compute_msd(traj, cfg):
     ss_tot = float(np.sum((msd[:n_fit] - msd[:n_fit].mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else nan
 
-    # Power-law fit over the whole positive curve: MSD = A * t**alpha.  alpha
-    # near 1 confirms ordinary (non-anomalous) Brownian diffusion.
+    # Anomalous-diffusion exponent from a power-law fit MSD = A * t**alpha.
+    #
+    # A naive log-log fit of the RAW MSD is biased low because static
+    # localization error adds a constant offset (the linear-fit `intercept`):
+    # MSD = 4*D*t + b.  That offset lifts the short-lag points and flattens the
+    # log-log slope, faking sub-diffusion (alpha < 1) even for perfectly
+    # ordinary Brownian motion.  The physically meaningful exponent comes from
+    # the OFFSET-REMOVED curve, (MSD - b) ~ t**alpha.  We report that as
+    # `alpha`, and keep the uncorrected value as `alpha_raw` for transparency.
     pos = (lags > 0) & (msd > 0)
     if pos.sum() >= 2:
-        alpha, logA = np.polyfit(np.log(lags[pos]), np.log(msd[pos]), 1)
-        loglog_A = float(np.exp(logA))
+        alpha_raw = float(np.polyfit(np.log(lags[pos]), np.log(msd[pos]), 1)[0])
     else:
-        alpha, loglog_A = nan, nan
+        alpha_raw = nan
+
+    corr = msd - intercept                       # remove localization-error floor
+    cpos = (lags > 0) & (corr > 0)
+    if cpos.sum() >= 2:
+        alpha, logA = np.polyfit(np.log(lags[cpos]), np.log(corr[cpos]), 1)
+        loglog_A = float(np.exp(logA))
+    else:                                        # fall back to the raw fit
+        alpha, loglog_A = alpha_raw, nan
 
     return {"em": em, "D": slope / 4.0, "slope": slope, "intercept": intercept,
             "n_fit": n_fit, "r2": r2, "alpha": float(alpha),
-            "loglog_A": loglog_A}
+            "alpha_raw": alpha_raw, "loglog_A": loglog_A}
 
 
 def per_particle_diffusion(traj, cfg, n_fit):
@@ -653,10 +668,13 @@ def save_summary_figure(msd_res, Ds, phys, cfg, out_png):
     b = axs[0, 1]
     pos = (lags > 0) & (msd > 0)
     b.loglog(lags[pos], msd[pos], "o", ms=4, color="#1f77b4", label="MSD")
-    if np.isfinite(msd_res["alpha"]):
-        b.loglog(lags[pos], msd_res["loglog_A"] * lags[pos] ** msd_res["alpha"],
-                 "-", lw=2, color="#2ca02c",
-                 label=r"$\alpha$ = " + f"{msd_res['alpha']:.3f}")
+    if np.isfinite(msd_res["alpha"]) and np.isfinite(msd_res["loglog_A"]):
+        # Offset-corrected power law: MSD = b + A*t**alpha (b = localization
+        # floor), so the curve overlays the raw log-log MSD across all lags.
+        model = (msd_res["intercept"]
+                 + msd_res["loglog_A"] * lags[pos] ** msd_res["alpha"])
+        b.loglog(lags[pos], model, "-", lw=2, color="#2ca02c",
+                 label=r"$\alpha$ = " + f"{msd_res['alpha']:.3f} (offset-corr.)")
     b.set_xlabel("lag time t (s)")
     b.set_ylabel(f"MSD ({unit}$^2$)")
     b.set_title(r"(B) log-log MSD  (slope $\alpha$, 1 = normal)")
@@ -1128,7 +1146,8 @@ def main():
           f"(MSD slope {msd_res['slope']:.4g}, fit over first {n_fit} lags, "
           f"R^2 = {msd_res['r2']:.4f}, 2D: MSD = 4*D*t + offset)")
     print(f"Anomalous-diffusion exponent  alpha = {msd_res['alpha']:.3f}  "
-          f"(1.0 = ordinary Brownian diffusion)")
+          f"(offset-corrected; raw power-law {msd_res['alpha_raw']:.3f}; "
+          f"1.0 = ordinary Brownian diffusion)")
 
     # Per-particle spread -> statistical (bead-to-bead) uncertainty on D.
     Ds = per_particle_diffusion(analysis_traj, cfg, n_fit)
@@ -1138,6 +1157,11 @@ def main():
         D_rel_err_stat = D_sem / abs(float(np.mean(Ds)))
         print(f"Per-particle D = {np.mean(Ds):.4g} +/- {D_sem:.2g} {unit} "
               f"(SEM over n = {Ds.size} beads, {100 * D_rel_err_stat:.1f}%)")
+        # Ensemble vs per-particle is a systematic the SEM doesn't capture.
+        D_spread = (float(np.mean(Ds)) - D) / D if D else float("nan")
+        print(f"D estimator spread = {100 * D_spread:+.1f}%  "
+              f"(per-particle mean vs ensemble D = {D:.4g}; "
+              f"report as a systematic)")
 
     # --- Stokes-Einstein physics (only if the bead/temperature are given) --- #
     phys = None
@@ -1205,16 +1229,22 @@ def _write_analysis_txt(path, msd_res, Ds, phys, cfg):
     Dmean = float(np.mean(Ds)) if Ds.size else float("nan")
     Dsem = float(np.std(Ds, ddof=1) / np.sqrt(Ds.size)) if Ds.size > 1 \
         else float("nan")
+    Dens = float(msd_res["D"])
+    Dspread = 100 * (Dmean - Dens) / Dens if (Ds.size and Dens) else float("nan")
+    alpha_raw = msd_res.get("alpha_raw", float("nan"))
     lines = [
         f"Brownian motion analysis  -  {os.path.basename(cfg.path)}",
         "=" * 56,
         "",
-        f"ensemble D        = {msd_res['D']:.6g} {unit}",
+        f"ensemble D        = {msd_res['D']:.6g} {unit}   (used for kB / N_A)",
         f"per-particle D    = {Dmean:.6g} +/- {Dsem:.3g} {unit} "
         f"(SEM, n={Ds.size})",
+        f"D estimator spread= {Dspread:+.1f} %  "
+        f"(per-particle vs ensemble; systematic, quote alongside stat. error)",
         f"MSD linear-fit R2 = {msd_res['r2']:.5f} "
         f"(first {msd_res['n_fit']} lags)",
-        f"anomalous alpha   = {msd_res['alpha']:.4f}",
+        f"anomalous alpha   = {msd_res['alpha']:.4f}  "
+        f"(offset-corrected; raw power-law {alpha_raw:.4f})",
         "",
         "inputs (value +/- 1 sigma):",
         f"  acquisition fps   = {cfg.fps}",
