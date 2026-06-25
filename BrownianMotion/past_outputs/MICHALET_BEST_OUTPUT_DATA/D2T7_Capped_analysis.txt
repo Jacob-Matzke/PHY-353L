@@ -1,0 +1,37 @@
+Brownian motion analysis  -  D2T7_Capped.tif
+========================================================
+
+ensemble D        = 0.560394 um^2/s   (used for kB / N_A)
+per-particle D    = 0.543082 +/- 0.0358 um^2/s (SEM, n=36; reference only)
+D_stat (bootstrap)= 5.0 %  (ensemble-D, n=300 resamples; 95% CI [0.5117,0.6158] um^2/s) -- USED in budget
+D_window (syst.)  = +/-5.9 %  (MSD fit-window / fast-bead selection bias; Michalet 2010) -- USED in budget
+reduced loc. err x= 2.48  ->  Michalet p_min = 6 lags (fit window used = 6, mode 'michalet')
+robust filter     = 1 bead(s) rejected (|D-median| > 3.5 MAD)
+D estimator spread= -3.1 %  (per-particle vs ensemble; systematic, quote alongside stat. error)
+MSD linear-fit R2 = 0.99913 (first 6 lags)
+anomalous alpha   = 0.9553  (offset-corrected; raw power-law 0.7643)
+
+inputs (value +/- 1 sigma):
+  acquisition fps   = 30.0
+  microns/pixel     = 0.1388888888888889 +/- 0.002
+  bead diameter     = 1.0 +/- 0.05 um
+  water temperature = 25.9 +/- 0.05 degC
+
+T                 = 299.050 K
+water viscosity   = 8.724447e-04 Pa*s
+bead radius       = 5.000000e-07 m
+Stokes drag gamma = 8.222597e-09 kg/s
+
+kB  (measured)    = 1.540844e-23 +/- 1.482e-24 J/K
+kB  (literature)  = 1.380649e-23 J/K   (+11.60 %)
+N_A (measured)    = 5.396044e+23 +/- 5.191e+22 /mol
+N_A (literature)  = 6.022141e+23 /mol   (-10.40 %)
+D   (theory)      = 0.502132 um^2/s   (measured +11.60 %)
+
+error budget (relative, added in quadrature):
+  D_window      =   5.87 %   (  37 % of total variance)
+  bead_radius   =   5.00 %   (  27 % of total variance)
+  D_stat        =   4.98 %   (  27 % of total variance)
+  D_calibration =   2.88 %   (   9 % of total variance)
+  temperature   =   0.13 %   (   0 % of total variance)
+  TOTAL kB/N_A  =   9.62 %

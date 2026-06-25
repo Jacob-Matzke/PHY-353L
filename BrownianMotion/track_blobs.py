@@ -98,7 +98,8 @@ def dln_viscosity_dT(temp_c):
 
 def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
                     D_rel_err_stat=0.0, mpp_rel_err=0.0,
-                    bead_diameter_rel_err=0.0, temp_err_c=0.0):
+                    bead_diameter_rel_err=0.0, temp_err_c=0.0,
+                    D_window_rel_err=0.0):
     """
     Invert the Stokes-Einstein relation to recover fundamental constants, with
     full first-order (quadrature) uncertainty propagation.
@@ -111,6 +112,8 @@ def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
         bead_diameter_um     bead diameter                         [um]
         temp_c               water temperature                     [degC]
         D_rel_err_stat       statistical rel. error on D (e.g. bead-to-bead SEM)
+        D_window_rel_err     rel. systematic from the MSD fit-window choice /
+                             fast-bead selection bias (Michalet 2010)
         mpp_rel_err          rel. error on the microns/pixel calibration
         bead_diameter_rel_err rel. error on the bead diameter
         temp_err_c           absolute temperature uncertainty      [degC == K]
@@ -150,6 +153,7 @@ def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
 
     budget = {
         "D_stat": D_rel_err_stat,
+        "D_window": D_window_rel_err,          # MSD fit-window / selection bias
         "D_calibration": rel_D_cal,
         "bead_radius": rel_r,
         "temperature": rel_T,
@@ -504,10 +508,13 @@ def save_filter_diagnostics(diag, cfg, out_png):
     print(f"Saved filter diagnostics -> {out_png}")
 
 
-def compute_msd(traj, cfg):
+def compute_msd(traj, cfg, n_fit_override=None):
     """
     Ensemble mean-squared displacement and a diffusion coefficient from the
     short-lag slope (MSD = 4*D*t in 2D).
+
+    n_fit_override fixes the number of short-lag points fitted (e.g. the
+    Michalet-optimal p_min); otherwise msd_fit_frac sets it.
 
     Returns a dict with the ensemble MSD series plus the fitted quantities:
         em        ensemble MSD (pandas Series indexed by lag time in s)
@@ -518,6 +525,7 @@ def compute_msd(traj, cfg):
         r2        coefficient of determination of that linear fit
         alpha     anomalous-diffusion exponent (MSD ~ t**alpha, ~1 = normal)
         loglog_A  prefactor of the power-law fit MSD = A * t**alpha
+        x_red     reduced localization error x = sigma^2/(D*dt)  (Michalet 2010)
     Units are px^2/s if mpp==1, else um^2/s.
     """
     em = tp.emsd(traj, mpp=cfg.mpp, fps=cfg.fps,
@@ -526,16 +534,24 @@ def compute_msd(traj, cfg):
     if len(em) < 2:
         return {"em": em, "D": nan, "slope": nan, "intercept": nan,
                 "n_fit": 0, "r2": nan, "alpha": nan, "alpha_raw": nan,
-                "loglog_A": nan}
+                "loglog_A": nan, "x_red": nan}
     lags, msd = em.index.values, em.values
 
-    # Linear fit over the first msd_fit_frac of the curve.  MSD(t) = 4*D*t +
-    # offset, where offset is the static localization-error floor in 2D.  Only
-    # the short-lag, well-sampled part of the curve is statistically reliable
-    # (fewer overlapping intervals contribute at long lags), so we fit a
-    # leading fraction rather than the whole thing.
-    n_fit = max(2, int(round(len(lags) * cfg.msd_fit_frac)))
+    # Linear fit over the first n_fit points.  MSD(t) = 4*D*t + offset, where
+    # offset is the static localization-error floor in 2D.  Only the short-lag,
+    # well-sampled part of the curve is statistically reliable (fewer
+    # overlapping intervals contribute at long lags), so we fit a leading
+    # window -- either a fixed fraction or an explicit n_fit_override.
+    if n_fit_override is not None:
+        n_fit = int(np.clip(n_fit_override, 2, len(lags)))
+    else:
+        n_fit = max(2, int(round(len(lags) * cfg.msd_fit_frac)))
     slope, intercept = np.polyfit(lags[:n_fit], msd[:n_fit], 1)
+
+    # Reduced localization error (Michalet 2010, Eq. 20): x = sigma^2/(D*dt).
+    # With MSD = 4*D*t + 4*sigma^2, this is just intercept / (slope * dt).
+    dt = 1.0 / cfg.fps if cfg.fps else nan
+    x_red = (intercept / (slope * dt)) if (slope > 0 and dt > 0) else nan
 
     # R^2 of the linear fit (how straight / diffusive the fitted window is).
     yfit = slope * lags[:n_fit] + intercept
@@ -568,7 +584,8 @@ def compute_msd(traj, cfg):
 
     return {"em": em, "D": slope / 4.0, "slope": slope, "intercept": intercept,
             "n_fit": n_fit, "r2": r2, "alpha": float(alpha),
-            "alpha_raw": alpha_raw, "loglog_A": loglog_A}
+            "alpha_raw": alpha_raw, "loglog_A": loglog_A,
+            "x_red": float(x_red)}
 
 
 def per_particle_diffusion(traj, cfg, n_fit):
@@ -578,13 +595,13 @@ def per_particle_diffusion(traj, cfg, n_fit):
     values gives an empirical uncertainty on D (and hence on kB / N_A) without
     assuming anything about the noise model.
 
-    Returns a 1-D numpy array of D values [um^2/s or px^2/s], one per particle
-    that yields a positive slope.
+    Returns (Ds, pids): a 1-D array of D values [um^2/s or px^2/s] and the
+    matching particle ids, one entry per particle that yields a positive slope.
     """
     im = tp.imsd(traj, mpp=cfg.mpp, fps=cfg.fps, max_lagtime=cfg.msd_max_lag)
     lags = im.index.values
     k = min(max(2, n_fit), len(lags))
-    Ds = []
+    Ds, pids = [], []
     for pid in im.columns:
         msd = im[pid].values[:k]
         good = np.isfinite(msd)
@@ -592,7 +609,173 @@ def per_particle_diffusion(traj, cfg, n_fit):
             slope = np.polyfit(lags[:k][good], msd[good], 1)[0]
             if slope > 0:
                 Ds.append(slope / 4.0)
-    return np.asarray(Ds, dtype=float)
+                pids.append(pid)
+    return np.asarray(Ds, dtype=float), np.asarray(pids)
+
+
+def _ensemble_D(traj, cfg, n_fit):
+    """Ensemble-MSD diffusion coefficient from the first n_fit lags (slope/4)."""
+    em = tp.emsd(traj, mpp=cfg.mpp, fps=cfg.fps, max_lagtime=cfg.msd_max_lag)
+    k = min(max(2, n_fit), len(em))
+    if k < 2:
+        return float("nan")
+    return float(np.polyfit(em.index.values[:k], em.values[:k], 1)[0] / 4.0)
+
+
+def bootstrap_ensemble_D(traj, cfg, n_fit, n_boot, seed=0):
+    """
+    Statistical uncertainty on the ENSEMBLE D via a bead-level bootstrap:
+    resample whole trajectories with replacement and recompute the ensemble-MSD
+    D each time.  This matches the estimator actually used for kB / N_A and is
+    less conservative than the per-particle SEM, because the ensemble MSD pools
+    every displacement pair rather than averaging noisy per-bead slopes.
+
+    Returns (rel_err, lo95, hi95): the relative std of D and its 95% percentile
+    interval [um^2/s or px^2/s].  (nan, nan, nan) if there are too few tracks.
+    """
+    import pandas as pd
+    pids = list(dict.fromkeys(traj["particle"]))
+    npid = len(pids)
+    if n_boot < 2 or npid < 2:
+        return float("nan"), float("nan"), float("nan")
+    groups = {p: traj[traj["particle"] == p] for p in pids}
+    sizes = [len(groups[p]) for p in pids]
+    rng = np.random.default_rng(seed)
+    Ds = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, npid, npid)
+        sub = pd.concat([groups[pids[i]] for i in idx], ignore_index=True)
+        # Relabel so a track drawn twice counts as two independent beads.
+        sub["particle"] = np.repeat(np.arange(npid), [sizes[i] for i in idx])
+        Ds.append(_ensemble_D(sub, cfg, n_fit))
+    Ds = np.asarray(Ds, dtype=float)
+    Ds = Ds[np.isfinite(Ds)]
+    if Ds.size < 2:
+        return float("nan"), float("nan"), float("nan")
+    D0 = float(np.mean(Ds))
+    return (float(np.std(Ds) / abs(D0)) if D0 else float("nan"),
+            float(np.percentile(Ds, 2.5)), float(np.percentile(Ds, 97.5)))
+
+
+def robust_track_filter(Ds, pids, n_mad):
+    """
+    Identify per-bead D outliers (mis-linked / doublet tracks).  Keeps values
+    within median +/- n_mad * MAD (MAD scaled to a Gaussian sigma).  Returns a
+    boolean keep-mask aligned with Ds/pids and the array of rejected pids.
+    n_mad <= 0 (or too few beads) keeps everything.
+    """
+    keep = np.ones(Ds.size, dtype=bool)
+    if n_mad > 0 and Ds.size >= 4:
+        med = float(np.median(Ds))
+        mad = 1.4826 * float(np.median(np.abs(Ds - med)))
+        if mad > 0:
+            keep = np.abs(Ds - med) <= n_mad * mad
+    return keep, pids[~keep]
+
+
+def michalet_pmin(x_red):
+    """
+    Optimal number of MSD points to fit for D, from the reduced localization
+    error x (Michalet 2010, Phys. Rev. E 82, 041914, Eq. 30):
+
+        p_min = floor(2 + 2.7 * sqrt(x))
+
+    With localization error the MSD curves away from a straight line, so fitting
+    too many lags biases D; this is the variance-minimizing window.  Returns
+    None if x is undefined.
+    """
+    if not np.isfinite(x_red) or x_red < 0:
+        return None
+    return int(np.floor(2 + 2.7 * np.sqrt(x_red)))
+
+
+def fit_window_scan(traj, cfg, w_lo, w_hi):
+    """
+    Ensemble-MSD D for every integer fit window in [w_lo, w_hi] lags.  The
+    spread of these values is the fit-window systematic (and exposes the
+    fast-bead selection bias: D drifts down as longer lags are included).
+    Returns (windows, Ds).
+    """
+    em = tp.emsd(traj, mpp=cfg.mpp, fps=cfg.fps, max_lagtime=cfg.msd_max_lag)
+    lags, msd = em.index.values, em.values
+    w_hi = min(w_hi, len(lags))
+    windows, Ds = [], []
+    for w in range(max(2, int(w_lo)), int(w_hi) + 1):
+        windows.append(w)
+        Ds.append(np.polyfit(lags[:w], msd[:w], 1)[0] / 4.0)
+    return np.asarray(windows), np.asarray(Ds, dtype=float)
+
+
+def per_track_length_D(traj, cfg, k=6):
+    """
+    Per-track (length, short-lag D) for the selection-bias diagnostic: if fast
+    beads leave the field of view sooner, short tracks carry higher D.
+    Returns (lengths, Ds).
+    """
+    lens, Ds = [], []
+    for pid, g in traj.groupby("particle"):
+        im = tp.imsd(g.assign(particle=pid), mpp=cfg.mpp, fps=cfg.fps,
+                     max_lagtime=k)
+        c = im.iloc[:, 0].dropna()
+        if len(c) >= 3:
+            slope = np.polyfit(c.index.values, c.values, 1)[0]
+            if slope > 0:
+                lens.append(len(g))
+                Ds.append(slope / 4.0)
+    return np.asarray(lens), np.asarray(Ds, dtype=float)
+
+
+def save_fitwindow_diagnostic(windows, Ds_win, p_min, chosen, frac_w,
+                              lens, Dtrack, x_red, cfg, out_png):
+    """
+    Two-panel Michalet diagnostic:
+      (A) ensemble D vs MSD fit window, with the Michalet p_min and the chosen
+          window marked, and the systematic band shaded.
+      (B) per-track D vs track length -- evidence for fast-bead selection bias.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    unit = "um" if cfg.mpp != 1.0 else "px"
+    fig, (a, b) = plt.subplots(1, 2, figsize=(11, 4.4))
+
+    a.plot(windows, Ds_win, "o-", ms=4, color="#1f77b4")
+    if np.isfinite(Ds_win).any():
+        a.axhspan(np.nanmin(Ds_win), np.nanmax(Ds_win), color="#d62728",
+                  alpha=0.08, label="fit-window spread")
+    if p_min:
+        a.axvline(p_min, color="#2ca02c", lw=2,
+                  label=f"Michalet $p_{{min}}$ = {p_min}  (x={x_red:.2f})")
+    a.axvline(chosen, color="#d62728", ls="--", lw=2,
+              label=f"chosen window = {chosen}")
+    if frac_w and frac_w != chosen:
+        a.axvline(frac_w, color="#7f7f7f", ls=":", lw=1.5,
+                  label=f"naive frac window = {frac_w}")
+    a.set_xlabel("MSD fit window (lags)")
+    a.set_ylabel(f"ensemble D ({unit}$^2$/s)")
+    a.set_title("(A) D vs fit window  (Michalet 2010)")
+    a.legend(fontsize=8)
+
+    if lens.size and Dtrack.size:
+        b.plot(lens, Dtrack, "o", ms=5, color="#9467bd", alpha=0.7)
+        try:
+            from scipy.stats import spearmanr
+            rho, pv = spearmanr(lens, Dtrack)
+            b.set_title(f"(B) per-track D vs length  "
+                        f"(Spearman $\\rho$={rho:.2f}, p={pv:.2f})")
+        except Exception:
+            b.set_title("(B) per-track D vs track length")
+        if lens.size > 2:                     # trend line
+            m, c0 = np.polyfit(lens, Dtrack, 1)
+            xs = np.array([lens.min(), lens.max()])
+            b.plot(xs, m * xs + c0, "-", color="#d62728", lw=1.5)
+    b.set_xlabel("track length (frames)")
+    b.set_ylabel(f"per-track D ({unit}$^2$/s)")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+    plt.close(fig)
+    print(f"Saved fit-window diagnostic -> {out_png}")
 
 
 def save_msd_plot(msd_res, cfg, out_png):
@@ -1037,9 +1220,22 @@ def parse_args():
     m.add_argument("--msd-max-lag", type=int, default=40,
                    help="Max lag time (frames) for the MSD curve")
     m.add_argument("--msd-fit-frac", type=float, default=0.5,
-                   help="Fraction of the MSD curve (short lags) used for the "
-                        "linear D fit (default 0.5; the reported R^2 tells you "
-                        "if the window stayed in the straight diffusive regime)")
+                   help="Fraction of the MSD curve used by the 'frac' fit "
+                        "window, and the upper bound of the window systematic")
+    m.add_argument("--fit-window", default="michalet",
+                   help="MSD fit window: 'michalet' (optimal p_min from the "
+                        "reduced localization error, Michalet 2010; default), "
+                        "'frac' (msd-fit-frac of the curve), or an integer "
+                        "number of lags")
+    m.add_argument("--bootstrap", type=int, default=300,
+                   help="Bead-level bootstrap resamples for the ensemble-D "
+                        "statistical error (D_stat in the budget). "
+                        "0 = fall back to the per-particle SEM")
+    m.add_argument("--bootstrap-seed", type=int, default=0,
+                   help="RNG seed for the D bootstrap (reproducibility)")
+    m.add_argument("--robust-mad", type=float, default=3.5,
+                   help="Drop per-bead D outliers beyond this many MADs from "
+                        "the median before the final fit. 0 = keep all beads")
 
     s = p.add_argument_group("physics (Stokes-Einstein: kB, N_A)")
     s.add_argument("--bead-diameter", "--bead_diameter", dest="bead_diameter",
@@ -1133,30 +1329,105 @@ def main():
         print("Subtracted ensemble drift before MSD analysis.")
 
     # --- Diffusion analysis ------------------------------------------------- #
-    msd_res = compute_msd(analysis_traj, cfg)
-    D, n_fit = msd_res["D"], msd_res["n_fit"]
     unit = "um^2/s" if cfg.mpp != 1.0 else "px^2/s"
 
+    # Preliminary ensemble MSD sets the short-lag fit window (n_fit); the
+    # per-particle D values then drive both outlier rejection and the spread.
+    msd_res = compute_msd(analysis_traj, cfg)
+    n_fit = msd_res["n_fit"]
+    Ds, Dpids = per_particle_diffusion(analysis_traj, cfg, n_fit)
+
+    # (#2) Robust safeguard: drop per-bead MAD-outliers (mis-linked / doublet
+    # tracks whose D is wildly off).  The ensemble D is pair-weighted and
+    # already fairly outlier-insensitive, so this usually removes very few.
+    keep, rejected = robust_track_filter(Ds, Dpids, cfg.robust_mad)
+    if rejected.size:
+        analysis_traj = analysis_traj[
+            ~analysis_traj["particle"].isin(rejected)]
+        Ds = Ds[keep]
+        print(f"Robust filter: dropped {rejected.size} MAD-outlier bead(s) "
+              f"(|D-median| > {cfg.robust_mad:g} MAD) before the final fit.")
+        msd_res = compute_msd(analysis_traj, cfg)     # refit on the robust set
+        n_fit = msd_res["n_fit"]
+
+    # --- Michalet (2010) fit-window selection ------------------------------- #
+    # With localization error the MSD bends, so the D you extract depends on how
+    # many lags you fit.  The optimal window p_min = floor(2 + 2.7*sqrt(x))
+    # (x = reduced localization error) minimizes the bias+variance on D.
+    frac_w = msd_res["n_fit"]
+    x_red = msd_res.get("x_red", float("nan"))
+    p_min = michalet_pmin(x_red)
+    if cfg.fit_window == "michalet":
+        chosen = p_min if p_min else frac_w
+    elif cfg.fit_window == "frac":
+        chosen = frac_w
+    else:                                             # explicit integer window
+        chosen = int(cfg.fit_window)
+    if chosen != msd_res["n_fit"]:
+        msd_res = compute_msd(analysis_traj, cfg, n_fit_override=chosen)
+    n_fit = msd_res["n_fit"]
+
+    # Fit-window systematic: spread of ensemble D from the Michalet optimum out
+    # to the naive long ("frac") window.  This captures the fast-bead selection
+    # bias (D drifts down as longer lags, dominated by slow survivors, enter).
+    w_lo = min(chosen, p_min) if p_min else chosen
+    win_w, win_D = fit_window_scan(analysis_traj, cfg, w_lo, max(chosen, frac_w))
+    D_window_rel_err = 0.0
+    if win_D.size >= 2 and msd_res["D"]:
+        D_window_rel_err = (0.5 * (np.nanmax(win_D) - np.nanmin(win_D))
+                            / abs(msd_res["D"]))
+    msd_res["x_red"] = x_red
+    msd_res["p_min"] = p_min
+    msd_res["fit_window"] = chosen
+    msd_res["frac_window"] = frac_w
+    msd_res["D_window_rel_err"] = D_window_rel_err
+    msd_res["win_scan"] = (win_w, win_D)
+
+    D = msd_res["D"]
     if not np.isfinite(D):
         print("\nNot enough trajectory overlap to estimate MSD/D.")
         view(frames, clean_traj, cfg)
         return
 
-    print(f"\nDiffusion coefficient  D = {D:.4g} {unit}  "
+    win_tag = ("Michalet p_min" if cfg.fit_window == "michalet"
+               else f"--fit-window {cfg.fit_window}")
+    print(f"\nReduced localization error x = {x_red:.2f}  ->  "
+          f"Michalet p_min = {p_min} lags  (chosen window: {n_fit}, {win_tag})")
+    print(f"Diffusion coefficient  D = {D:.4g} {unit}  "
           f"(MSD slope {msd_res['slope']:.4g}, fit over first {n_fit} lags, "
           f"R^2 = {msd_res['r2']:.4f}, 2D: MSD = 4*D*t + offset)")
+    print(f"Fit-window systematic  = +/-{100 * D_window_rel_err:.1f}%  "
+          f"(ensemble D ranges {np.nanmin(win_D):.4g}-{np.nanmax(win_D):.4g} "
+          f"{unit} over windows {w_lo}-{max(chosen, frac_w)} lags)")
     print(f"Anomalous-diffusion exponent  alpha = {msd_res['alpha']:.3f}  "
           f"(offset-corrected; raw power-law {msd_res['alpha_raw']:.3f}; "
           f"1.0 = ordinary Brownian diffusion)")
 
-    # Per-particle spread -> statistical (bead-to-bead) uncertainty on D.
-    Ds = per_particle_diffusion(analysis_traj, cfg, n_fit)
+    # (#1) Statistical error on the ENSEMBLE D via a bead-level bootstrap -- the
+    # estimator-matched D_stat used in the error budget (less conservative than
+    # the per-bead SEM, which over-weights short, noisy single-track fits).
     D_rel_err_stat = 0.0
+    boot_rel, boot_lo, boot_hi = bootstrap_ensemble_D(
+        analysis_traj, cfg, n_fit, cfg.bootstrap, cfg.bootstrap_seed)
+    msd_res["D_stat_boot"] = boot_rel
+    msd_res["boot_ci"] = (boot_lo, boot_hi)
+    msd_res["n_boot"] = cfg.bootstrap
+    msd_res["n_rejected"] = int(rejected.size)
+    if np.isfinite(boot_rel):
+        D_rel_err_stat = boot_rel
+        print(f"Ensemble-D bootstrap: D_stat = {100 * boot_rel:.1f}%  "
+              f"(95% CI [{boot_lo:.4g}, {boot_hi:.4g}] {unit}, "
+              f"{cfg.bootstrap} resamples)")
+
+    # Per-particle spread: shown for transparency, and the fallback D_stat if
+    # the bootstrap is disabled (--bootstrap 0).
     if Ds.size > 1 and np.mean(Ds):
         D_sem = float(np.std(Ds, ddof=1) / np.sqrt(Ds.size))
-        D_rel_err_stat = D_sem / abs(float(np.mean(Ds)))
+        sem_rel = D_sem / abs(float(np.mean(Ds)))
+        if not np.isfinite(boot_rel):
+            D_rel_err_stat = sem_rel
         print(f"Per-particle D = {np.mean(Ds):.4g} +/- {D_sem:.2g} {unit} "
-              f"(SEM over n = {Ds.size} beads, {100 * D_rel_err_stat:.1f}%)")
+              f"(SEM over n = {Ds.size} beads, {100 * sem_rel:.1f}%; reference)")
         # Ensemble vs per-particle is a systematic the SEM doesn't capture.
         D_spread = (float(np.mean(Ds)) - D) / D if D else float("nan")
         print(f"D estimator spread = {100 * D_spread:+.1f}%  "
@@ -1176,7 +1447,8 @@ def main():
             phys = stokes_einstein(
                 D, cfg.bead_diameter, cfg.water_temp,
                 D_rel_err_stat=D_rel_err_stat, mpp_rel_err=mpp_rel,
-                bead_diameter_rel_err=dia_rel, temp_err_c=cfg.water_temp_err)
+                bead_diameter_rel_err=dia_rel, temp_err_c=cfg.water_temp_err,
+                D_window_rel_err=msd_res.get("D_window_rel_err", 0.0))
             print("\n--- Stokes-Einstein  (D = kB*T / (6*pi*eta*r)) ---")
             print(f"  T               = {phys['T_K']:.2f} K "
                   f"({cfg.water_temp:.1f} degC)")
@@ -1200,6 +1472,14 @@ def main():
     save_summary_figure(msd_res, Ds, phys, cfg, base + "_summary.png")
     save_tracks_plot(clean_traj, cfg, base + "_tracks.png")       # image-aligned
     save_displacement_hist(analysis_traj, cfg, base + "_displacements.png")
+    win_w, win_D = msd_res.get("win_scan", (np.array([]), np.array([])))
+    lens, Dtrack = per_track_length_D(analysis_traj, cfg,
+                                      k=msd_res.get("fit_window", 6))
+    save_fitwindow_diagnostic(win_w, win_D, msd_res.get("p_min"),
+                              msd_res.get("fit_window"),
+                              msd_res.get("frac_window"), lens, Dtrack,
+                              msd_res.get("x_red", float("nan")), cfg,
+                              base + "_fitwindow.png")
 
     view(frames, clean_traj, cfg)
 
@@ -1232,13 +1512,33 @@ def _write_analysis_txt(path, msd_res, Ds, phys, cfg):
     Dens = float(msd_res["D"])
     Dspread = 100 * (Dmean - Dens) / Dens if (Ds.size and Dens) else float("nan")
     alpha_raw = msd_res.get("alpha_raw", float("nan"))
+    boot = msd_res.get("D_stat_boot", float("nan"))
+    blo, bhi = msd_res.get("boot_ci", (float("nan"), float("nan")))
+    nrej = msd_res.get("n_rejected", 0)
+    if np.isfinite(boot):
+        dstat_line = (f"D_stat (bootstrap)= {100 * boot:.1f} %  "
+                      f"(ensemble-D, n={msd_res.get('n_boot', '?')} resamples; "
+                      f"95% CI [{blo:.4g},{bhi:.4g}] {unit}) -- USED in budget")
+    else:
+        dstat_line = (f"D_stat (per-bead) = {100 * Dsem / Dmean:.1f} %  "
+                      f"(SEM; bootstrap disabled) -- USED in budget")
     lines = [
         f"Brownian motion analysis  -  {os.path.basename(cfg.path)}",
         "=" * 56,
         "",
         f"ensemble D        = {msd_res['D']:.6g} {unit}   (used for kB / N_A)",
         f"per-particle D    = {Dmean:.6g} +/- {Dsem:.3g} {unit} "
-        f"(SEM, n={Ds.size})",
+        f"(SEM, n={Ds.size}; reference only)",
+        dstat_line,
+        f"D_window (syst.)  = +/-{100 * msd_res.get('D_window_rel_err', 0):.1f}"
+        f" %  (MSD fit-window / fast-bead selection bias; Michalet 2010) "
+        f"-- USED in budget",
+        f"reduced loc. err x= {msd_res.get('x_red', float('nan')):.2f}  ->  "
+        f"Michalet p_min = {msd_res.get('p_min')} lags "
+        f"(fit window used = {msd_res.get('fit_window')}, "
+        f"mode '{cfg.fit_window}')",
+        f"robust filter     = {nrej} bead(s) rejected "
+        f"(|D-median| > {cfg.robust_mad:g} MAD)",
         f"D estimator spread= {Dspread:+.1f} %  "
         f"(per-particle vs ensemble; systematic, quote alongside stat. error)",
         f"MSD linear-fit R2 = {msd_res['r2']:.5f} "
