@@ -99,7 +99,7 @@ def dln_viscosity_dT(temp_c):
 def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
                     D_rel_err_stat=0.0, mpp_rel_err=0.0,
                     bead_diameter_rel_err=0.0, temp_err_c=0.0,
-                    D_window_rel_err=0.0):
+                    D_method_rel_err=0.0):
     """
     Invert the Stokes-Einstein relation to recover fundamental constants, with
     full first-order (quadrature) uncertainty propagation.
@@ -112,8 +112,9 @@ def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
         bead_diameter_um     bead diameter                         [um]
         temp_c               water temperature                     [degC]
         D_rel_err_stat       statistical rel. error on D (e.g. bead-to-bead SEM)
-        D_window_rel_err     rel. systematic from the MSD fit-window choice /
-                             fast-bead selection bias (Michalet 2010)
+        D_method_rel_err     rel. systematic from the choice of D estimator
+                             (MSD fit-window scan + CVE; Michalet 2010,
+                             Vestergaard 2014)
         mpp_rel_err          rel. error on the microns/pixel calibration
         bead_diameter_rel_err rel. error on the bead diameter
         temp_err_c           absolute temperature uncertainty      [degC == K]
@@ -153,7 +154,7 @@ def stokes_einstein(D_um2_s, bead_diameter_um, temp_c,
 
     budget = {
         "D_stat": D_rel_err_stat,
-        "D_window": D_window_rel_err,          # MSD fit-window / selection bias
+        "D_method": D_method_rel_err,          # estimator spread (windows + CVE)
         "D_calibration": rel_D_cal,
         "bead_radius": rel_r,
         "temperature": rel_T,
@@ -725,12 +726,55 @@ def per_track_length_D(traj, cfg, k=6):
     return np.asarray(lens), np.asarray(Ds, dtype=float)
 
 
+def cve_diffusion(traj, cfg, blur_R=1.0 / 6.0):
+    """
+    Covariance-based estimator (CVE) of the diffusion coefficient
+    (Vestergaard, Blainey & Flyvbjerg 2010 -> Phys. Rev. E 89, 022726, 2014).
+
+    An MSD-free, regression-free estimator built from the variance of
+    single-frame steps and their lag-1 covariance:
+
+        D = <dx_n^2> / (2*dt)  +  <dx_n * dx_{n+1}> / dt
+
+    The (negative) covariance term cancels the localization-error and
+    motion-blur inflation exactly, so D is unbiased without knowing either.
+    It is an INDEPENDENT cross-check on the MSD/Michalet D (no curve fitting).
+    The localization error needs the motion-blur coefficient R (1/6 for uniform
+    full-frame illumination):  sigma^2 = R*<dx^2> + (2R-1)*<dx_n dx_{n+1}>.
+
+    Steps are pooled over x, y and all tracks, using only runs of consecutive
+    frames.  Returns (D, sigma_loc) in [um^2/s or px^2/s] and [um or px].
+    """
+    dt = 1.0 / cfg.fps if cfg.fps else float("nan")
+    s = cfg.mpp if cfg.mpp != 1.0 else 1.0
+    sq_sum, sq_n, cov_sum, cov_n = 0.0, 0, 0.0, 0
+    for _, g in traj.groupby("particle"):
+        g = g.sort_values("frame")
+        f = g["frame"].values
+        consec = np.diff(f) == 1                  # single-frame steps
+        adj = consec[:-1] & consec[1:]            # 3 consecutive frames
+        for coord in (g["x"].values * s, g["y"].values * s):
+            dc = np.diff(coord)
+            sq = dc[consec]
+            sq_sum += float(np.sum(sq ** 2)); sq_n += sq.size
+            prod = dc[:-1][adj] * dc[1:][adj]
+            cov_sum += float(np.sum(prod)); cov_n += prod.size
+    if sq_n == 0 or not np.isfinite(dt):
+        return float("nan"), float("nan")
+    msq = sq_sum / sq_n
+    mcov = cov_sum / cov_n if cov_n else 0.0
+    D = msq / (2 * dt) + mcov / dt
+    sig2 = blur_R * msq + (2 * blur_R - 1) * mcov
+    sigma = np.sqrt(sig2) if sig2 > 0 else float("nan")
+    return D, sigma
+
+
 def save_fitwindow_diagnostic(windows, Ds_win, p_min, chosen, frac_w,
-                              lens, Dtrack, x_red, cfg, out_png):
+                              lens, Dtrack, x_red, cfg, out_png, D_cve=None):
     """
     Two-panel Michalet diagnostic:
       (A) ensemble D vs MSD fit window, with the Michalet p_min and the chosen
-          window marked, and the systematic band shaded.
+          window marked, the CVE estimator overlaid, and the systematic shaded.
       (B) per-track D vs track length -- evidence for fast-bead selection bias.
     """
     import matplotlib
@@ -740,10 +784,16 @@ def save_fitwindow_diagnostic(windows, Ds_win, p_min, chosen, frac_w,
     unit = "um" if cfg.mpp != 1.0 else "px"
     fig, (a, b) = plt.subplots(1, 2, figsize=(11, 4.4))
 
-    a.plot(windows, Ds_win, "o-", ms=4, color="#1f77b4")
-    if np.isfinite(Ds_win).any():
-        a.axhspan(np.nanmin(Ds_win), np.nanmax(Ds_win), color="#d62728",
-                  alpha=0.08, label="fit-window spread")
+    a.plot(windows, Ds_win, "o-", ms=4, color="#1f77b4", label="MSD vs window")
+    # Systematic band spans all estimators (windows + CVE).
+    band = [v for v in (list(Ds_win) + ([D_cve] if D_cve else []))
+            if np.isfinite(v)]
+    if band:
+        a.axhspan(min(band), max(band), color="#d62728", alpha=0.08,
+                  label="estimator spread")
+    if D_cve and np.isfinite(D_cve):
+        a.axhline(D_cve, color="#ff7f0e", lw=2, ls="-.",
+                  label=f"CVE (Vestergaard) = {D_cve:.3g}")
     if p_min:
         a.axvline(p_min, color="#2ca02c", lw=2,
                   label=f"Michalet $p_{{min}}$ = {p_min}  (x={x_red:.2f})")
@@ -776,6 +826,54 @@ def save_fitwindow_diagnostic(windows, Ds_win, p_min, chosen, frac_w,
     fig.savefig(out_png, dpi=130)
     plt.close(fig)
     print(f"Saved fit-window diagnostic -> {out_png}")
+
+
+def subpixel_bias(traj, out_png=None):
+    """
+    Pixel-locking diagnostic (cf. trackpy.subpx_bias).  Histograms the sub-pixel
+    remainder of the RAW image positions (x, y mod 1 px): unbiased localization
+    is uniform, pixel-locking piles counts up at integer pixels.  Pixel-locking
+    means the localization error is correlated (not white), which violates the
+    CVE's assumptions and biases it -- so we use it to flag the CVE.
+
+    Pass the raw image-aligned (pre-drift, pixel) trajectories.  Returns
+    (mod_x, mod_y): peak-to-trough modulation / mean (0 = uniform, >~0.2 locked).
+    """
+    fx = np.mod(traj["x"].values, 1.0)
+    fy = np.mod(traj["y"].values, 1.0)
+    n, nb = len(fx), 20
+    if n == 0:
+        return 0.0, 0.0
+
+    def _hist_mod(fr):
+        c, _ = np.histogram(fr, bins=nb, range=(0, 1))
+        return c, ((c.max() - c.min()) / c.mean() if c.mean() else 0.0)
+
+    cx, mx = _hist_mod(fx)
+    cy, my = _hist_mod(fy)
+    if out_png is not None:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from scipy.stats import chisquare
+        centers = np.linspace(0, 1, nb, endpoint=False) + 0.5 / nb
+        fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+        for ax, c, lab, m in [(axs[0], cx, "x", mx), (axs[1], cy, "y", my)]:
+            _, p = chisquare(c, np.full(nb, n / nb))
+            ax.bar(centers, c, width=0.9 / nb, color="#1f77b4",
+                   edgecolor="white")
+            ax.axhline(n / nb, color="#d62728", ls="--", lw=2, label="uniform")
+            ax.set_title(f"sub-pixel remainder of {lab}\n"
+                         f"modulation {100 * m:.0f}%  ($\\chi^2$ p={p:.1g})")
+            ax.set_xlabel(f"{lab} mod 1 (px)")
+            ax.legend(fontsize=8)
+        axs[0].set_ylabel("count")
+        fig.suptitle("Pixel-locking check  (flat = unbiased localization)")
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=130)
+        plt.close(fig)
+        print(f"Saved pixel-locking diagnostic -> {out_png}")
+    return float(mx), float(my)
 
 
 def save_msd_plot(msd_res, cfg, out_png):
@@ -1236,6 +1334,14 @@ def parse_args():
     m.add_argument("--robust-mad", type=float, default=3.5,
                    help="Drop per-bead D outliers beyond this many MADs from "
                         "the median before the final fit. 0 = keep all beads")
+    m.add_argument("--blur-coeff", type=float, default=1.0 / 6.0,
+                   help="Motion-blur coefficient R for the CVE localization "
+                        "error (1/6 for uniform full-frame exposure, 0 for "
+                        "instantaneous). Does not affect the CVE D")
+    m.add_argument("--pixel-lock-thresh", type=float, default=0.25,
+                   help="Sub-pixel histogram modulation above which "
+                        "pixel-locking is flagged; the CVE is then treated as "
+                        "an upper bound and excluded from the systematic")
 
     s = p.add_argument_group("physics (Stokes-Einstein: kB, N_A)")
     s.add_argument("--bead-diameter", "--bead_diameter", dest="bead_diameter",
@@ -1367,20 +1473,17 @@ def main():
         msd_res = compute_msd(analysis_traj, cfg, n_fit_override=chosen)
     n_fit = msd_res["n_fit"]
 
-    # Fit-window systematic: spread of ensemble D from the Michalet optimum out
-    # to the naive long ("frac") window.  This captures the fast-bead selection
-    # bias (D drifts down as longer lags, dominated by slow survivors, enter).
+    # Ensemble D at every fit window from the Michalet optimum out to the naive
+    # long ("frac") window (the fast-bead selection bias drifts D down as longer
+    # lags enter).  D_long = the value at the longest window, for reporting.
     w_lo = min(chosen, p_min) if p_min else chosen
-    win_w, win_D = fit_window_scan(analysis_traj, cfg, w_lo, max(chosen, frac_w))
-    D_window_rel_err = 0.0
-    if win_D.size >= 2 and msd_res["D"]:
-        D_window_rel_err = (0.5 * (np.nanmax(win_D) - np.nanmin(win_D))
-                            / abs(msd_res["D"]))
+    w_hi = max(chosen, frac_w)
+    win_w, win_D = fit_window_scan(analysis_traj, cfg, w_lo, w_hi)
+    D_long = float(np.nanmin(win_D)) if win_D.size else float("nan")
     msd_res["x_red"] = x_red
     msd_res["p_min"] = p_min
     msd_res["fit_window"] = chosen
     msd_res["frac_window"] = frac_w
-    msd_res["D_window_rel_err"] = D_window_rel_err
     msd_res["win_scan"] = (win_w, win_D)
 
     D = msd_res["D"]
@@ -1389,16 +1492,57 @@ def main():
         view(frames, clean_traj, cfg)
         return
 
+    # Third, independent estimator: covariance-based estimator (CVE, Vestergaard
+    # 2014).  MSD-free; keys on the lag-1 step statistics, so on a curving MSD it
+    # sits at the short-time (highest) end.  Reported for scientific integrity.
+    D_cve, cve_sigma = cve_diffusion(analysis_traj, cfg, blur_R=cfg.blur_coeff)
+    msd_res["D_cve"] = D_cve
+    msd_res["cve_sigma"] = cve_sigma
+
+    # Pixel-locking check on the RAW (pre-drift) positions.  If localization is
+    # locked to integer pixels its error is correlated, not white -- which
+    # violates the CVE's assumptions and biases it high.  When detected we treat
+    # the CVE as a flagged UPPER BOUND and exclude it from the systematic.
+    mod_x, mod_y = subpixel_bias(clean_traj, base + "_subpixel_bias.png")
+    pixel_locked = max(mod_x, mod_y) > cfg.pixel_lock_thresh
+    msd_res["pix_mod"] = (mod_x, mod_y)
+    msd_res["pixel_locked"] = pixel_locked
+
+    # Method/estimator systematic.  Default = half the spread of the MSD
+    # fit-window scan.  The CVE is folded in ONLY if localization is clean;
+    # under pixel-locking it is excluded (kept as a flagged upper bound).
+    win_only = (0.5 * (np.nanmax(win_D) - np.nanmin(win_D)) / abs(D)
+                if win_D.size >= 2 and D else 0.0)
+    cve_in_syst = (not pixel_locked) and np.isfinite(D_cve)
+    if cve_in_syst:
+        all_D = np.append(win_D[np.isfinite(win_D)], D_cve)
+        D_method_rel_err = (0.5 * (np.nanmax(all_D) - np.nanmin(all_D)) / abs(D)
+                            if all_D.size >= 2 and D else win_only)
+    else:
+        D_method_rel_err = win_only
+    msd_res["D_method_rel_err"] = D_method_rel_err
+    msd_res["cve_in_syst"] = cve_in_syst
+
+    cve_flag = ("UPPER BOUND - pixel-locking, excluded from systematic"
+                if pixel_locked else "independent estimator, in systematic")
     win_tag = ("Michalet p_min" if cfg.fit_window == "michalet"
                else f"--fit-window {cfg.fit_window}")
     print(f"\nReduced localization error x = {x_red:.2f}  ->  "
           f"Michalet p_min = {p_min} lags  (chosen window: {n_fit}, {win_tag})")
-    print(f"Diffusion coefficient  D = {D:.4g} {unit}  "
-          f"(MSD slope {msd_res['slope']:.4g}, fit over first {n_fit} lags, "
-          f"R^2 = {msd_res['r2']:.4f}, 2D: MSD = 4*D*t + offset)")
-    print(f"Fit-window systematic  = +/-{100 * D_window_rel_err:.1f}%  "
-          f"(ensemble D ranges {np.nanmin(win_D):.4g}-{np.nanmax(win_D):.4g} "
-          f"{unit} over windows {w_lo}-{max(chosen, frac_w)} lags)")
+    print(f"Pixel-locking check: x modulation {100 * mod_x:.0f}%, "
+          f"y {100 * mod_y:.0f}%  -> {'LOCKED' if pixel_locked else 'clean'} "
+          f"(threshold {100 * cfg.pixel_lock_thresh:.0f}%)")
+    print("Diffusion coefficient -- three independent estimators:")
+    sig_txt = (f"; sigma_loc {cve_sigma * 1e3:.0f} nm" if cfg.mpp != 1.0 else "")
+    print(f"  CVE  (Vestergaard 2014, lag-1) D = {D_cve:.4g} {unit}  "
+          f"({100 * (D_cve / D - 1):+.1f}%{sig_txt})  [{cve_flag}]")
+    print(f"  MSD @ Michalet p_min={n_fit}  (PRIMARY)  D = {D:.4g} {unit}  "
+          f"(R^2 = {msd_res['r2']:.4f}; used for kB / N_A)")
+    print(f"  MSD @ long window={w_hi}            D = {D_long:.4g} {unit}  "
+          f"({100 * (D_long / D - 1):+.1f}%)")
+    src = ("MSD fit-window spread; CVE excluded (pixel-locking)"
+           if not cve_in_syst else "all three estimators")
+    print(f"  -> method systematic = +/-{100 * D_method_rel_err:.1f}%  ({src})")
     print(f"Anomalous-diffusion exponent  alpha = {msd_res['alpha']:.3f}  "
           f"(offset-corrected; raw power-law {msd_res['alpha_raw']:.3f}; "
           f"1.0 = ordinary Brownian diffusion)")
@@ -1448,7 +1592,7 @@ def main():
                 D, cfg.bead_diameter, cfg.water_temp,
                 D_rel_err_stat=D_rel_err_stat, mpp_rel_err=mpp_rel,
                 bead_diameter_rel_err=dia_rel, temp_err_c=cfg.water_temp_err,
-                D_window_rel_err=msd_res.get("D_window_rel_err", 0.0))
+                D_method_rel_err=msd_res.get("D_method_rel_err", 0.0))
             print("\n--- Stokes-Einstein  (D = kB*T / (6*pi*eta*r)) ---")
             print(f"  T               = {phys['T_K']:.2f} K "
                   f"({cfg.water_temp:.1f} degC)")
@@ -1479,7 +1623,8 @@ def main():
                               msd_res.get("fit_window"),
                               msd_res.get("frac_window"), lens, Dtrack,
                               msd_res.get("x_red", float("nan")), cfg,
-                              base + "_fitwindow.png")
+                              base + "_fitwindow.png",
+                              D_cve=msd_res.get("D_cve"))
 
     view(frames, clean_traj, cfg)
 
@@ -1522,25 +1667,44 @@ def _write_analysis_txt(path, msd_res, Ds, phys, cfg):
     else:
         dstat_line = (f"D_stat (per-bead) = {100 * Dsem / Dmean:.1f} %  "
                       f"(SEM; bootstrap disabled) -- USED in budget")
+    Dcve = msd_res.get("D_cve", float("nan"))
+    _, win_D = msd_res.get("win_scan", (np.array([]), np.array([])))
+    Dlong = float(np.nanmin(win_D)) if getattr(win_D, "size", 0) else float("nan")
+    fw = msd_res.get("fit_window")
+    fr = msd_res.get("frac_window")
+    mx, my = msd_res.get("pix_mod", (float("nan"), float("nan")))
+    locked = msd_res.get("pixel_locked", False)
+    cve_in = msd_res.get("cve_in_syst", True)
+    cve_note = ("UPPER BOUND (pixel-locking; excluded from systematic)"
+                if locked else "independent estimator (in systematic)")
+    syst_src = ("MSD fit-window spread only; CVE excluded due to pixel-locking"
+                if not cve_in else "all three estimators")
     lines = [
         f"Brownian motion analysis  -  {os.path.basename(cfg.path)}",
         "=" * 56,
         "",
-        f"ensemble D        = {msd_res['D']:.6g} {unit}   (used for kB / N_A)",
+        "diffusion coefficient -- three independent estimators:",
+        f"  CVE (Vestergaard 2014, lag-1)   D = {Dcve:.6g} {unit} "
+        f"({100 * (Dcve / Dens - 1):+.1f}%)  [{cve_note}]",
+        f"  MSD @ Michalet p_min={fw} (PRIMARY) D = {Dens:.6g} {unit}"
+        f"   <- used for kB / N_A",
+        f"  MSD @ long window={fr}            D = {Dlong:.6g} {unit} "
+        f"({100 * (Dlong / Dens - 1):+.1f}%)",
+        f"reduced loc. err x= {msd_res.get('x_red', float('nan')):.2f}  ->  "
+        f"Michalet p_min = {msd_res.get('p_min')} lags (mode '{cfg.fit_window}')",
+        f"pixel-locking     = x {100 * mx:.0f}%, y {100 * my:.0f}% modulation "
+        f"-> {'LOCKED' if locked else 'clean'} (see *_subpixel_bias.png). "
+        f"Correlated localization error breaks the CVE white-noise assumption,",
+        f"                    so the CVE is reported but flagged as an upper "
+        f"bound (Berglund 2010; Michalet & Berglund 2012).",
+        "",
+        dstat_line,
+        f"D_method (syst.)  = +/-{100 * msd_res.get('D_method_rel_err', 0):.1f}"
+        f" %  ({syst_src}; Michalet 2010) -- USED in budget",
         f"per-particle D    = {Dmean:.6g} +/- {Dsem:.3g} {unit} "
         f"(SEM, n={Ds.size}; reference only)",
-        dstat_line,
-        f"D_window (syst.)  = +/-{100 * msd_res.get('D_window_rel_err', 0):.1f}"
-        f" %  (MSD fit-window / fast-bead selection bias; Michalet 2010) "
-        f"-- USED in budget",
-        f"reduced loc. err x= {msd_res.get('x_red', float('nan')):.2f}  ->  "
-        f"Michalet p_min = {msd_res.get('p_min')} lags "
-        f"(fit window used = {msd_res.get('fit_window')}, "
-        f"mode '{cfg.fit_window}')",
         f"robust filter     = {nrej} bead(s) rejected "
         f"(|D-median| > {cfg.robust_mad:g} MAD)",
-        f"D estimator spread= {Dspread:+.1f} %  "
-        f"(per-particle vs ensemble; systematic, quote alongside stat. error)",
         f"MSD linear-fit R2 = {msd_res['r2']:.5f} "
         f"(first {msd_res['n_fit']} lags)",
         f"anomalous alpha   = {msd_res['alpha']:.4f}  "
